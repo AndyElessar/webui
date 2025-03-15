@@ -25,7 +25,7 @@ export default {
           items: [
             { text: 'Introduction', link: '/guide/' },
             { text: 'Installation', link: '/guide/installation' },
-            { text: 'Quick Start', link: '/guide/quick-start' },
+            { text: 'Quick Start', link: '/guide/tutorials/hello-world' },
           ]
         },
         {
@@ -60,10 +60,7 @@ export default {
           text: 'Platform Handlers',
           items: [
             { text: 'Overview', link: '/handlers/' },
-            { text: 'Rust', link: '/handlers/rust' },
-            { text: 'Go', link: '/handlers/go' },
-            { text: 'Node.js', link: '/handlers/node' },
-            { text: '.NET', link: '/handlers/dotnet' },
+            { text: 'Rust', link: '/handlers/rust' }
           ]
         }
       ],

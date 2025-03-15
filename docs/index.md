@@ -52,4 +52,4 @@ Traditional web frameworks require a JavaScript runtime, leading to bloated depe
 
 ## Getting Started
 
-Check out our [Quick Start Guide](/guide/quick-start) to build your first WebUI application in minutes!
+Check out our [Quick Start Guide](/guide/tutorials/hello-world) to build your first WebUI application in minutes!

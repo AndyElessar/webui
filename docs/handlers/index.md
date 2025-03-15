@@ -4,12 +4,9 @@ WebUI handlers are the bridge between the WebUI protocol and the final rendered 
 
 ## Available Handlers
 
-WebUI provides official handlers for several popular programming languages:
+WebUI provides official handlers for several popular programming languages (other languages coming soon):
 
 - [**Rust**](./rust) - High-performance native rendering with the Rust programming language
-- [**Go**](./go) - Fast and efficient rendering with the Go programming language
-- [**Node.js**](./node) - JavaScript-based rendering for Node.js applications
-- [**.NET**](./dotnet) - C# implementation for .NET applications
 
 ## How Handlers Work
 
