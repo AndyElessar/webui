@@ -17,8 +17,8 @@ webui-protocol = { path = "../webui-protocol" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 console = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 webui-protocol = { path = "../webui-protocol" }
-serde_json = { workspace = true }
