@@ -135,10 +135,9 @@ The `docs/` directory is a VitePress site for external developers consuming WebU
 
 ---
 
-## Branch and commit discipline
+## Skills
 
-- **Never commit to `main` directly.** Create a branch: `<user>/<short-description>` (e.g. `mmansour/optimize-handler-allocs`).
-- One logical change per commit. Write imperative messages: *"Add …"* not *"Added …"*.
+- **Pull request** — `.github/skills/pr/SKILL.md`
 
 ---
 
