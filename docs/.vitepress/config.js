@@ -54,6 +54,7 @@ export default {
                 { text: '<if> Conditional', link: '/guide/concepts/directives/if' },
                 { text: '<for> Loop', link: '/guide/concepts/directives/for' },
                 { text: '{{}} Signals', link: '/guide/concepts/directives/signals' },
+                { text: 'Attribute Directives', link: '/guide/concepts/directives/attributes' },
               ]
             },
             {
@@ -63,13 +64,6 @@ export default {
                 { text: 'Rust', link: '/guide/concepts/handlers/rust' }
               ]
             }
-          ]
-        },
-        {
-          text: 'Advanced Topics',
-          items: [
-            { text: 'WebUI Protocol', link: '/guide/advanced/protocol' },
-            { text: 'Performance Optimization', link: '/guide/advanced/performance' },
           ]
         }
       ],
