@@ -1,7 +1,7 @@
 //! App and integration build tasks.
 
 use crate::util::{collect_child_dirs, display_name, run_command};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 // ── Integration builds ──────────────────────────────────────────────────
@@ -43,6 +43,26 @@ pub const INTEGRATION_BUILDS: &[IntegrationBuild] = &[
             cmd: "cargo",
             args: &["run", "--"],
             cwd: Some("examples/integration/tiny_http"),
+        }],
+    },
+    IntegrationBuild {
+        name: "node-express",
+        commands: &[
+            BuildCommand {
+                cmd: "cargo",
+                args: &["build", "-p", "webui-node"],
+                cwd: None,
+            },
+            BuildCommand {
+                cmd: "npm",
+                args: &["ci", "--no-audit", "--no-fund"],
+                cwd: Some("examples/integration/node-express"),
+            },
+        ],
+        run_commands: &[BuildCommand {
+            cmd: "node",
+            args: &["src/index.js"],
+            cwd: Some("examples/integration/node-express"),
         }],
     },
 ];
@@ -91,10 +111,7 @@ pub fn run_app_builds() -> Result<(), String> {
             ));
         }
 
-        let output_dir = PathBuf::from("target")
-            .join("xtask")
-            .join("app-builds")
-            .join(app_name.as_str());
+        let output_dir = app_dir.join("dist");
 
         eprintln!("  • app: {}", app_name);
         run_command(
