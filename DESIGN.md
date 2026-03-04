@@ -54,6 +54,8 @@ pub enum Fragment {
     ForLoop(WebUIFragmentFor),
     Signal(WebUIFragmentSignal),
     IfCond(WebUIFragmentIf),
+    Attribute(WebUIFragmentAttribute),
+    Plugin(WebUIFragmentPlugin),
 }
 ```
 ### Fragment Types
@@ -120,6 +122,16 @@ pub struct WebUIFragmentAttribute {
     pub raw_value: bool,
     /// For `?`-prefixed boolean attributes, the condition tree.
     pub condition_tree: Option<ConditionExpr>,
+}
+```
+
+#### Plugin Fragment
+Plugin fragments carry opaque data from parser plugins to handler plugins. WebUI does
+not interpret this data — each parser/handler plugin pair defines its own binary contract.
+```rust
+pub struct WebUIFragmentPlugin {
+    /// Opaque plugin-specific binary data.
+    pub data: Vec<u8>,
 }
 ```
 
@@ -239,20 +251,69 @@ pub enum ExpressionError {
 ```
 
 ## Handler Implementation (webui-handler)
-### Core Function
+### Core API
 ```rust
-pub fn handler(
-    protocol: &WebUIProtocol,
-    state: &Value,
-    writer: impl Writer
-) -> Result<(), HandlerError>
+pub struct WebUIHandler {
+    plugin: Option<Box<dyn HandlerPlugin>>,
+}
+
+impl WebUIHandler {
+    pub fn new() -> Self;
+    pub fn with_plugin(plugin: Box<dyn HandlerPlugin>) -> Self;
+
+    pub fn handle(
+        &mut self,
+        protocol: &WebUIProtocol,
+        state: &Value,
+        writer: &mut dyn ResponseWriter,
+    ) -> Result<()>;
+}
 ```
 ### Writer Interface
 ```rust
-pub trait Writer {
-    fn write(&mut self, content: &str) -> Result<(), io::Error>;
-    fn end(&mut self) -> Result<(), io::Error>;
+pub trait ResponseWriter {
+    /// Write content to the output
+    fn write(&mut self, content: &str) -> Result<()>;
+    /// Finalize the output
+    fn end(&mut self) -> Result<()>;
 }
+```
+
+### Handler Plugin System
+The handler supports a framework-agnostic plugin system. Plugins receive lifecycle
+callbacks during rendering and can inject arbitrary content. WebUI does not interpret
+what plugins write — each framework defines its own marker format.
+
+```rust
+pub trait HandlerPlugin {
+    fn push_scope(&mut self);
+    fn pop_scope(&mut self);
+    fn on_binding_start(&mut self, name: &str, writer: &mut dyn ResponseWriter) -> Result<()>;
+    fn on_binding_end(&mut self, name: &str, writer: &mut dyn ResponseWriter) -> Result<()>;
+    fn on_repeat_item_start(&mut self, index: usize, writer: &mut dyn ResponseWriter) -> Result<()>;
+    fn on_repeat_item_end(&mut self, index: usize, writer: &mut dyn ResponseWriter) -> Result<()>;
+    fn on_plugin_data(&mut self, data: &[u8], writer: &mut dyn ResponseWriter) -> Result<()>;
+}
+```
+
+**Hook invocation points:**
+- **Signal**: `on_binding_start` before, `on_binding_end` after (same scope)
+- **For loop**: `on_binding_start/end` around entire loop; `on_repeat_item_start/end` + `push_scope/pop_scope` per item
+- **If condition**: `on_binding_start/end` around condition; `push_scope/pop_scope` if condition is true
+- **Component**: `push_scope/pop_scope` around component body
+- **Plugin fragment**: `on_plugin_data` with opaque bytes from protocol
+
+**Built-in plugin: `FastHydrationPlugin`**
+Injects FAST-HTML hydration comment markers for client-side re-hydration:
+- Binding: `<!--fe-b$$start$$INDEX$$NAME$$fe-b-->` / `<!--fe-b$$end$$INDEX$$NAME$$fe-b-->`
+- Repeat: `<!--fe-repeat$$start$$INDEX$$fe-repeat-->` / `<!--fe-repeat$$end$$INDEX$$fe-repeat-->`
+- Attribute (single): ` data-fe-b-INDEX`
+- Attribute (multi): ` data-fe-c-INDEX-COUNT`
+
+**Usage:**
+```rust
+let mut handler = WebUIHandler::with_plugin(Box::new(FastHydrationPlugin::new()));
+handler.handle(&protocol, &state, &mut writer)?;
 ```
 ### Fragment Processing
 - **Raw fragments:** Write value directly to output
@@ -280,6 +341,7 @@ pub trait Writer {
     the fields of the current item being looped over and the global state. The `Component` fragment doesn't need to use
     the `For` fragment item moniker and can access the fields without the qualification. If the `Component` fragment is
     nested in multiple `For` fragments only the closest enclosing `For` fragment item's state is accessible to it.
+- **Plugin fragments:** Pass opaque `data` bytes to the handler plugin's `on_plugin_data` hook. Skipped silently when no plugin is configured.
 
 ### State Management
 - Global state refers to the global application state that is available to all fragments at all times.
@@ -356,6 +418,44 @@ Set via `parser.set_css_strategy(CssStrategy::Inline)`.
 ```rust
 pub fn parse(&mut self, fragment_id: &str, html_content: &str) -> Result<(), ParserError>
 pub fn into_fragment_records(self) -> WebUIFragmentRecords
+```
+
+### Parser Plugin System
+The parser supports a framework-agnostic plugin system. Plugins customize parsing
+behavior for framework-specific needs (component discovery, attribute filtering,
+hydration data emission) without WebUI knowing framework internals.
+
+```rust
+pub trait ParserPlugin {
+    fn on_parse_component(&mut self, tag_name: &str, component: &Component) -> Result<()>;
+    fn should_skip_attribute(&self, attr_name: &str) -> bool;
+    fn on_body_end(&mut self) -> Option<String>;
+    fn on_element_parsed(&mut self, binding_attribute_count: u32) -> Option<Vec<u8>>;
+}
+```
+
+**Hook invocation points:**
+- **Attribute loop**: `should_skip_attribute` called per attribute; skipped attrs are not parsed
+- **Element completion**: `on_element_parsed` called with binding count after all attrs processed; returned bytes emitted as `Plugin` fragment
+- **Component encounter**: `on_parse_component` called when a custom element is found
+- **Body end**: `on_body_end` called before `body_end` signal; returned HTML injected as raw fragment
+
+**Built-in plugin: `FastParserPlugin`**
+- Skips FAST-specific runtime attributes (`@click`, `f-ref`, `f-slotted`, `f-children`)
+- Emits `Plugin` fragments with u32 LE attribute binding counts
+- Tracks components and injects `<f-template>` wrappers at body end
+- Converts BTR syntax to FAST syntax: `<if>`→`<f-when>`, `<for>`→`<f-repeat>`, `{{expr}}`→`{expr}` in `:attr` values
+
+**Usage:**
+```rust
+let mut parser = HtmlParser::with_plugin(Box::new(FastParserPlugin::new()));
+parser.parse("index.html", &html)?;
+```
+
+**CLI integration:**
+```bash
+webui build ./templates --out ./dist --plugin=fast
+webui start ./templates --state ./data/state.json --plugin=fast
 ```
 #### Content Processing
 
@@ -495,6 +595,27 @@ webui/
 - Performance considerations
 - Error handling guidelines
 - Examples for all major features
+
+## FFI Bindings (webui-ffi)
+
+The FFI crate exposes WebUI to host languages via a C-compatible ABI. The generated
+header is at `crates/webui-ffi/include/webui_ffi.h`.
+
+### Functions
+
+| Function | Description |
+|----------|-------------|
+| `webui_render(html, data_json)` | Parse + render in one call. Returns heap-allocated string (caller frees with `webui_free`). |
+| `webui_handler_create()` | Create a reusable handler (no plugin). |
+| `webui_handler_create_with_plugin(plugin_id)` | Create a handler with a named plugin (e.g. `"fast"`). Returns `NULL` on error. |
+| `webui_handler_render(handler, data, len, json)` | Render a pre-compiled protocol. Returns heap-allocated string. |
+| `webui_handler_destroy(handler)` | Destroy a handler. `NULL` is a safe no-op. |
+| `webui_free(ptr)` | Free a string returned by any render function. `NULL` is a safe no-op. |
+| `webui_last_error()` | Return per-thread error message. Caller must **not** free. |
+
+### Error Model
+Thread-local error storage following the POSIX `dlerror()` pattern. After any
+function returns `NULL`, call `webui_last_error()` for a human-readable diagnostic.
 
 ## CLI Tool (webui-cli)
 
