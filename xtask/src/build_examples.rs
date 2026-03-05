@@ -29,6 +29,15 @@ pub const INTEGRATION_BUILDS: &[IntegrationBuild] = &[
         run_commands: &[],
     },
     IntegrationBuild {
+        name: "electron",
+        commands: &[BuildCommand {
+            cmd: "pnpm",
+            args: &["run", "build"],
+            cwd: Some("examples/integration/electron"),
+        }],
+        run_commands: &[],
+    },
+    IntegrationBuild {
         name: "rust",
         commands: &[BuildCommand {
             cmd: "cargo",
@@ -36,6 +45,19 @@ pub const INTEGRATION_BUILDS: &[IntegrationBuild] = &[
                 "check",
                 "--manifest-path",
                 "examples/integration/rust/Cargo.toml",
+            ],
+            cwd: None,
+        }],
+        run_commands: &[],
+    },
+    IntegrationBuild {
+        name: "ssr-performance-showdown",
+        commands: &[BuildCommand {
+            cmd: "cargo",
+            args: &[
+                "check",
+                "--manifest-path",
+                "examples/integration/ssr-performance-showdown/Cargo.toml",
             ],
             cwd: None,
         }],
