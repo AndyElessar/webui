@@ -52,6 +52,11 @@ impl ParserPlugin for FastParserPlugin {
     }
 
     fn on_parse_component(&mut self, tag_name: &str, component: &Component) -> Result<()> {
+        // Only track each component once (avoids duplicate <f-template> blocks
+        // when a component is used in multiple parent templates)
+        if self.components.iter().any(|c| c.tag_name == tag_name) {
+            return Ok(());
+        }
         self.components.push(TrackedComponent {
             tag_name: tag_name.to_string(),
             html_content: component.html_content.clone(),
@@ -607,6 +612,46 @@ mod tests {
 
         assert!(html.contains("<f-template name=\"comp-a\">"));
         assert!(html.contains("<f-template name=\"comp-b\">"));
+    }
+
+    #[test]
+    fn body_end_deduplicates_same_component() {
+        let mut plugin = FastParserPlugin::new();
+        let comp = make_component(
+            "my-button",
+            "<button><slot></slot></button>",
+            Some(".btn{}"),
+        );
+
+        // Simulate the same component encountered multiple times
+        // (e.g., <my-button> used in todo-app, todo-item, etc.)
+        plugin.on_parse_component("my-button", &comp).unwrap();
+        plugin.on_parse_component("my-button", &comp).unwrap();
+        plugin.on_parse_component("my-button", &comp).unwrap();
+
+        let output = plugin.on_body_end().unwrap();
+        let count = output.matches("<f-template name=\"my-button\">").count();
+        assert_eq!(
+            count, 1,
+            "Expected exactly 1 <f-template> for my-button, got {count}"
+        );
+    }
+
+    #[test]
+    fn body_end_deduplicates_mixed_components() {
+        let mut plugin = FastParserPlugin::new();
+        let btn = make_component("my-button", "<button><slot></slot></button>", None);
+        let card = make_component("my-card", "<div><slot></slot></div>", Some(".card{}"));
+
+        // my-button used in two different parent templates, my-card used once
+        plugin.on_parse_component("my-button", &btn).unwrap();
+        plugin.on_parse_component("my-card", &card).unwrap();
+        plugin.on_parse_component("my-button", &btn).unwrap();
+
+        let output = plugin.on_body_end().unwrap();
+
+        assert_eq!(output.matches("<f-template name=\"my-button\">").count(), 1);
+        assert_eq!(output.matches("<f-template name=\"my-card\">").count(), 1);
     }
 
     // --- BTR→FAST syntax conversion ---
