@@ -17,6 +17,9 @@ pub struct RouteMatch {
     pub params: HashMap<String, String>,
     /// How many literal (non-param) segments matched exactly.
     pub specificity: usize,
+    /// How many request path segments were consumed by the match.
+    /// Used by nested routes to compute the child route base.
+    pub consumed_segments: usize,
 }
 
 /// A single parsed segment from a path template.
@@ -67,6 +70,58 @@ fn split_path(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
+/// Convert an ASCII hex digit to its numeric value.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode a URL path segment (e.g. `%2F` → `/`, `%20` → ` `).
+///
+/// Returns `None` if the input contains malformed percent-encoding (a `%` not
+/// followed by two hex digits) or if the decoded bytes are not valid UTF-8.
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    if !bytes.contains(&b'%') {
+        return Some(input.to_owned());
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_val(bytes[i + 1])?;
+            let lo = hex_val(bytes[i + 2])?;
+            out.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Validate and percent-decode a single route parameter segment.
+///
+/// Returns `None` (rejecting the match) if the segment:
+/// - contains malformed percent-encoding,
+/// - decodes to `..` (path traversal), or
+/// - contains a NUL byte (`\0`).
+fn validate_param(value: &str) -> Option<String> {
+    let decoded = percent_decode(value)?;
+    if decoded == ".." || decoded.bytes().any(|b| b == 0) {
+        return None;
+    }
+    Some(decoded)
+}
+
 /// Try matching a request path against pre-parsed route template patterns.
 ///
 /// Returns `Some(RouteMatch)` if the path matches, `None` otherwise.
@@ -97,20 +152,24 @@ fn try_match(
                 if req_idx >= request_segments.len() {
                     return None;
                 }
-                params.insert(name.clone(), request_segments[req_idx].to_string());
+                params.insert(name.clone(), validate_param(request_segments[req_idx])?);
                 req_idx += 1;
             }
             SegmentPattern::OptionalParam(name) => {
                 if req_idx < request_segments.len() {
-                    params.insert(name.clone(), request_segments[req_idx].to_string());
+                    params.insert(name.clone(), validate_param(request_segments[req_idx])?);
                     req_idx += 1;
                 }
                 // Optional — ok to skip
             }
             SegmentPattern::Splat(name) => {
-                // Splat consumes all remaining segments
-                let remaining: Vec<&str> = request_segments[req_idx..].to_vec();
-                params.insert(name.clone(), remaining.join("/"));
+                // Splat consumes all remaining segments; validate each individually.
+                let remaining = &request_segments[req_idx..];
+                let mut decoded_parts = Vec::with_capacity(remaining.len());
+                for seg in remaining {
+                    decoded_parts.push(validate_param(seg)?);
+                }
+                params.insert(name.clone(), decoded_parts.join("/"));
                 req_idx = request_segments.len();
             }
         }
@@ -136,37 +195,8 @@ fn try_match(
         route_key: route_key.to_string(),
         params,
         specificity,
+        consumed_segments: req_idx,
     })
-}
-
-/// Match a request path against a set of routes.
-///
-/// Returns the best match: exact matches preferred, then highest specificity
-/// (most literal segments matched), then first defined.
-pub fn match_route(
-    routes: &HashMap<String, webui_protocol::RouteRecord>,
-    request_path: &str,
-) -> Option<RouteMatch> {
-    let request_segments = split_path(request_path);
-    let mut best_match: Option<RouteMatch> = None;
-
-    for (key, route) in routes {
-        let patterns = parse_template(&route.path);
-        let matched = try_match(key, &patterns, &request_segments, route.exact);
-
-        if let Some(m) = matched {
-            let is_better = match &best_match {
-                None => true,
-                Some(current) => m.specificity > current.specificity,
-            };
-
-            if is_better {
-                best_match = Some(m);
-            }
-        }
-    }
-
-    best_match
 }
 
 /// Match a single route template against a request path.
@@ -179,155 +209,108 @@ pub fn match_single_route(template: &str, request_path: &str, exact: bool) -> Op
     try_match("", &patterns, &request_segments, exact)
 }
 
+/// Check whether a route path is relative (does NOT start with `/`).
+pub fn is_relative_path(path: &str) -> bool {
+    !path.is_empty() && !path.starts_with('/')
+}
+
+/// Resolve a route path against a base path.
+///
+/// - Relative paths (`topics/:id` or `./topics/:id`) are prepended with the base.
+/// - Absolute paths (`/topics/:id`) are returned unchanged.
+///
+/// `"topics/:id"` + `"/sections/1"` → `"/sections/1/topics/:id"`
+/// `"./topics/:id"` + `"/sections/1"` → `"/sections/1/topics/:id"`
+/// `"/topics/:id"` + `"/sections/1"` → `"/topics/:id"`
+pub fn resolve_route_path(path: &str, route_base: &str) -> String {
+    // An empty path means "match at the parent level" — resolve to base.
+    if path.is_empty() {
+        return route_base.to_string();
+    }
+
+    if !is_relative_path(path) {
+        return path.to_string();
+    }
+
+    // Strip leading "./" if present
+    let relative = path.strip_prefix("./").unwrap_or(path);
+    if relative.is_empty() {
+        return route_base.to_string();
+    }
+
+    let mut resolved = String::with_capacity(route_base.len() + relative.len() + 1);
+    resolved.push_str(route_base);
+    if !route_base.ends_with('/') {
+        resolved.push('/');
+    }
+    resolved.push_str(relative);
+    resolved
+}
+
+/// Compute the new route base from a matched route's consumed request segments.
+///
+/// Given request path `/sections/1/topics/react` and consumed=2,
+/// returns `/sections/1`.
+pub fn compute_route_base(request_path: &str, consumed_segments: usize) -> String {
+    let parts = split_path(request_path);
+    if consumed_segments == 0 || parts.is_empty() {
+        return "/".to_string();
+    }
+
+    let n = consumed_segments.min(parts.len());
+    let mut base = String::with_capacity(request_path.len());
+    for part in &parts[..n] {
+        base.push('/');
+        base.push_str(part);
+    }
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webui_protocol::RouteRecord;
-
-    fn make_route(name: &str, path: &str, exact: bool, _params: &[&str]) -> (String, RouteRecord) {
-        (
-            name.to_string(),
-            RouteRecord {
-                name: name.to_string(),
-                path: path.to_string(),
-                fragment_id: format!("{name}-page"),
-                exact,
-            },
-        )
-    }
 
     #[test]
-    fn test_exact_root_match() {
-        let mut routes = HashMap::new();
-        routes.insert("home".into(), make_route("home", "/", true, &[]).1);
-        let m = match_route(&routes, "/").unwrap();
-        assert_eq!(m.route_key, "home");
+    fn test_match_single_route_exact() {
+        let m = match_single_route("/contacts", "/contacts", true).unwrap();
         assert!(m.params.is_empty());
     }
 
     #[test]
-    fn test_exact_static_path() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "contacts".into(),
-            make_route("contacts", "/contacts", true, &[]).1,
-        );
-        let m = match_route(&routes, "/contacts").unwrap();
-        assert_eq!(m.route_key, "contacts");
-    }
-
-    #[test]
-    fn test_exact_no_match_with_extra_segments() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "contacts".into(),
-            make_route("contacts", "/contacts", true, &[]).1,
-        );
-        assert!(match_route(&routes, "/contacts/123").is_none());
-    }
-
-    #[test]
-    fn test_param_match() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "detail".into(),
-            make_route("detail", "/contacts/:id", true, &["id"]).1,
-        );
-        let m = match_route(&routes, "/contacts/42").unwrap();
-        assert_eq!(m.route_key, "detail");
+    fn test_match_single_route_param() {
+        let m = match_single_route("/contacts/:id", "/contacts/42", true).unwrap();
         assert_eq!(m.params["id"], "42");
     }
 
     #[test]
-    fn test_multiple_params() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "profile-view".into(),
-            make_route(
-                "profile-view",
-                "/profile/:id/view/:section",
-                true,
-                &["id", "section"],
-            )
-            .1,
-        );
-        let m = match_route(&routes, "/profile/123/view/bio").unwrap();
+    fn test_match_single_route_no_match_extra() {
+        assert!(match_single_route("/contacts", "/contacts/123", true).is_none());
+    }
+
+    #[test]
+    fn test_match_single_route_multiple_params() {
+        let m = match_single_route("/profile/:id/view/:section", "/profile/123/view/bio", true)
+            .unwrap();
         assert_eq!(m.params["id"], "123");
         assert_eq!(m.params["section"], "bio");
     }
 
     #[test]
-    fn test_splat_match() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "files".into(),
-            make_route("files", "/files/*path", false, &["path"]).1,
-        );
-        let m = match_route(&routes, "/files/docs/readme.md").unwrap();
+    fn test_match_single_route_splat() {
+        let m = match_single_route("/files/*path", "/files/docs/readme.md", false).unwrap();
         assert_eq!(m.params["path"], "docs/readme.md");
     }
 
     #[test]
-    fn test_optional_param_present() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "search".into(),
-            make_route("search", "/search/:query?", true, &["query"]).1,
-        );
-        let m = match_route(&routes, "/search/hello").unwrap();
+    fn test_match_single_route_optional_param_present() {
+        let m = match_single_route("/search/:query?", "/search/hello", true).unwrap();
         assert_eq!(m.params["query"], "hello");
     }
 
     #[test]
-    fn test_optional_param_absent() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "search".into(),
-            make_route("search", "/search/:query?", true, &["query"]).1,
-        );
-        let m = match_route(&routes, "/search").unwrap();
+    fn test_match_single_route_optional_param_absent() {
+        let m = match_single_route("/search/:query?", "/search", true).unwrap();
         assert!(!m.params.contains_key("query"));
-    }
-
-    #[test]
-    fn test_specificity_prefers_exact_literals() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "add".into(),
-            make_route("add", "/contacts/add", true, &[]).1,
-        );
-        routes.insert(
-            "detail".into(),
-            make_route("detail", "/contacts/:id", true, &["id"]).1,
-        );
-        let m = match_route(&routes, "/contacts/add").unwrap();
-        assert_eq!(m.route_key, "add");
-    }
-
-    #[test]
-    fn test_no_match() {
-        let mut routes = HashMap::new();
-        routes.insert("home".into(), make_route("home", "/", true, &[]).1);
-        assert!(match_route(&routes, "/nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_non_exact_prefix_match() {
-        let mut routes = HashMap::new();
-        routes.insert("app".into(), make_route("app", "/", false, &[]).1);
-        // Non-exact "/" should match any path as a prefix
-        let m = match_route(&routes, "/anything").unwrap();
-        assert_eq!(m.route_key, "app");
-    }
-
-    #[test]
-    fn test_redirect_route_match() {
-        let mut routes = HashMap::new();
-        let mut redirect_route = make_route("old", "/old-path", true, &[]).1;
-        redirect_route.fragment_id = String::new();
-        routes.insert("old".into(), redirect_route);
-        let m = match_route(&routes, "/old-path").unwrap();
-        assert_eq!(m.route_key, "old");
     }
 
     #[test]
@@ -341,10 +324,202 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_path_matches_root() {
-        let mut routes = HashMap::new();
-        routes.insert("dashboard".into(), make_route("dashboard", "", true, &[]).1);
-        let m = match_route(&routes, "/").unwrap();
-        assert_eq!(m.route_key, "dashboard");
+    fn test_match_single_route_non_exact_prefix() {
+        let m = match_single_route("/", "/anything", false).unwrap();
+        assert!(m.params.is_empty());
+    }
+
+    // ── Consumed segments tests ──
+
+    #[test]
+    fn test_consumed_segments_exact() {
+        let m = match_single_route("/contacts/:id", "/contacts/42", true).unwrap();
+        assert_eq!(m.consumed_segments, 2);
+    }
+
+    #[test]
+    fn test_consumed_segments_prefix() {
+        let m = match_single_route("/sections/:id", "/sections/1/topics/react", false).unwrap();
+        assert_eq!(m.consumed_segments, 2);
+    }
+
+    #[test]
+    fn test_consumed_segments_root() {
+        let m = match_single_route("/", "/", true).unwrap();
+        assert_eq!(m.consumed_segments, 0);
+    }
+
+    #[test]
+    fn test_consumed_segments_splat() {
+        let m = match_single_route("/files/*path", "/files/docs/readme.md", false).unwrap();
+        assert_eq!(m.consumed_segments, 3);
+    }
+
+    // ── Relative path resolution tests ──
+
+    #[test]
+    fn test_is_relative_path() {
+        assert!(is_relative_path("./sections/:id"));
+        assert!(is_relative_path("./"));
+        assert!(is_relative_path("sections/:id")); // bare relative
+        assert!(is_relative_path("topics/:topicId")); // bare relative
+        assert!(!is_relative_path("/sections/:id")); // absolute
+        assert!(!is_relative_path("")); // empty
+    }
+
+    #[test]
+    fn test_resolve_route_path_dotslash_relative() {
+        assert_eq!(
+            resolve_route_path("./topics/:id", "/sections/1"),
+            "/sections/1/topics/:id"
+        );
+    }
+
+    #[test]
+    fn test_resolve_route_path_bare_relative() {
+        assert_eq!(
+            resolve_route_path("topics/:id", "/sections/1"),
+            "/sections/1/topics/:id"
+        );
+    }
+
+    #[test]
+    fn test_resolve_route_path_relative_at_root() {
+        assert_eq!(resolve_route_path("./sections/:id", "/"), "/sections/:id");
+        assert_eq!(resolve_route_path("sections/:id", "/"), "/sections/:id");
+    }
+
+    #[test]
+    fn test_resolve_route_path_absolute_unchanged() {
+        assert_eq!(
+            resolve_route_path("/sections/:id", "/some/base"),
+            "/sections/:id"
+        );
+    }
+
+    #[test]
+    fn test_resolve_route_path_deep_nesting() {
+        assert_eq!(
+            resolve_route_path("./lessons/:lessonId", "/sections/1/topics/react"),
+            "/sections/1/topics/react/lessons/:lessonId"
+        );
+        assert_eq!(
+            resolve_route_path("lessons/:lessonId", "/sections/1/topics/react"),
+            "/sections/1/topics/react/lessons/:lessonId"
+        );
+    }
+
+    #[test]
+    fn test_resolve_route_path_empty_resolves_to_base() {
+        assert_eq!(resolve_route_path("", "/search"), "/search");
+        assert_eq!(resolve_route_path("", "/"), "/");
+        assert_eq!(resolve_route_path("", "/a/b/c"), "/a/b/c");
+    }
+
+    #[test]
+    fn test_empty_child_route_matches_parent_path_exactly() {
+        // Simulates <route path="search"> <route path="" exact /> when visiting /search
+        let resolved = resolve_route_path("", "/search");
+        let m = match_single_route(&resolved, "/search", true);
+        assert!(m.is_some(), "empty child route must match parent path");
+        let m = m.unwrap();
+        assert_eq!(m.consumed_segments, 1);
+    }
+
+    // ── Compute route base tests ──
+
+    #[test]
+    fn test_compute_route_base_two_segments() {
+        assert_eq!(
+            compute_route_base("/sections/1/topics/react", 2),
+            "/sections/1"
+        );
+    }
+
+    #[test]
+    fn test_compute_route_base_zero() {
+        assert_eq!(compute_route_base("/sections/1", 0), "/");
+    }
+
+    #[test]
+    fn test_compute_route_base_all_segments() {
+        assert_eq!(
+            compute_route_base("/sections/1/topics/react", 4),
+            "/sections/1/topics/react"
+        );
+    }
+
+    #[test]
+    fn test_compute_route_base_exceeds_segments() {
+        assert_eq!(compute_route_base("/sections/1", 10), "/sections/1");
+    }
+
+    #[test]
+    fn test_param_rejects_traversal() {
+        // Exact `..` segment is path traversal — must reject.
+        assert!(match_single_route("/files/:name", "/files/..", true).is_none());
+    }
+
+    #[test]
+    fn test_param_allows_double_dot_prefix() {
+        // `..something` is NOT traversal (not a standalone `..` segment).
+        let m = match_single_route("/files/:name", "/files/..something", true).unwrap();
+        assert_eq!(m.params["name"], "..something");
+    }
+
+    #[test]
+    fn test_param_rejects_null_bytes() {
+        assert!(match_single_route("/users/:id", "/users/test\0injected", true).is_none());
+    }
+
+    #[test]
+    fn test_splat_rejects_traversal() {
+        assert!(
+            match_single_route("/files/*path", "/files/docs/../../../etc/passwd", false).is_none()
+        );
+    }
+
+    #[test]
+    fn test_param_rejects_encoded_traversal() {
+        // %2e%2e decodes to `..`
+        assert!(match_single_route("/files/:name", "/files/%2e%2e", true).is_none());
+    }
+
+    #[test]
+    fn test_param_rejects_mixed_encoded_traversal() {
+        // .%2e decodes to `..`
+        assert!(match_single_route("/files/:name", "/files/.%2e", true).is_none());
+        // %2e. decodes to `..`
+        assert!(match_single_route("/files/:name", "/files/%2e.", true).is_none());
+    }
+
+    #[test]
+    fn test_param_rejects_encoded_null() {
+        assert!(match_single_route("/users/:id", "/users/test%00injected", true).is_none());
+    }
+
+    #[test]
+    fn test_param_rejects_malformed_percent() {
+        assert!(match_single_route("/users/:id", "/users/100%", true).is_none());
+        assert!(match_single_route("/users/:id", "/users/100%ZZ", true).is_none());
+    }
+
+    #[test]
+    fn test_param_decodes_valid_percent_encoding() {
+        let m = match_single_route("/files/:name", "/files/hello%20world", true).unwrap();
+        assert_eq!(m.params["name"], "hello world");
+    }
+
+    #[test]
+    fn test_splat_decodes_segments() {
+        let m = match_single_route("/files/*path", "/files/my%20docs/read%20me.md", false).unwrap();
+        assert_eq!(m.params["path"], "my docs/read me.md");
+    }
+
+    #[test]
+    fn test_splat_rejects_encoded_traversal() {
+        assert!(
+            match_single_route("/files/*path", "/files/docs/%2e%2e/etc/passwd", false).is_none()
+        );
     }
 }
