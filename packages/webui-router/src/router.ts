@@ -14,6 +14,7 @@
  * templates, instantiates the component, and mounts it into the route.
  */
 
+import { clearInventoryBit, encodeInventoryHex, parseInventoryHex } from './inventory.js';
 import { buildNavigationTarget, prependBasePath } from './navigation-path.js';
 import type { RouterConfig, NavigationEvent } from './types.js';
 import type { NavigationTarget } from './navigation-path.js';
@@ -178,6 +179,36 @@ export class WebUIRouter {
     window.navigation.back();
   }
 
+  /**
+   * Release cached templates to free memory. Removes entries from
+   * `window.__webui_templates` and clears their inventory bits so the
+   * server will re-send them on the next navigation that needs them.
+   *
+   * The framework's `templateCache` is a `WeakMap` keyed by the same
+   * meta objects, so those entries become GC-eligible automatically.
+   *
+   * @param tags - Component tag names to release (e.g. `['section-page']`).
+   *               Omit to release all non-active templates.
+   */
+  releaseTemplates(tags?: string[]): void {
+    const registry = window.__webui_templates;
+    if (!registry) return;
+
+    const activeSet = new Set(this.activeChain.map(e => e.component));
+    const toRelease = tags
+      ? tags.filter(t => !activeSet.has(t))
+      : Object.keys(registry).filter(t => !activeSet.has(t));
+
+    if (toRelease.length === 0) return;
+
+    // Parse inventory hex → bytes, clear bits, re-encode
+    const inv = parseInventoryHex(this.inventory);
+    for (const tag of toRelease) {
+      delete registry[tag];
+      clearInventoryBit(inv, tag);
+    }
+    this.inventory = encodeInventoryHex(inv);
+  }
   /** Tear down. */
   destroy(): void {
     this.loaderPromises.clear();
@@ -461,17 +492,17 @@ export class WebUIRouter {
       this.updateInventory(data.inventory);
     }
 
-    // Register any new templates using a DocumentFragment (single append)
-    if (data.templates.length > 0) {
-      const frag = document.createDocumentFragment();
-      const container = document.createElement('div');
-      for (const tmpl of data.templates) {
-        container.innerHTML = tmpl;
-        while (container.firstChild) {
-          frag.appendChild(container.firstChild);
-        }
+    // Execute template registration scripts. Each entry is a
+    // "<script>…</script>" wrapper around an IIFE that writes to
+    // window.__webui_templates. Strip the tags and eval the code
+    // directly — no DOM parsing, no persistent allocations.
+    for (const tmpl of data.templates) {
+      const start = tmpl.indexOf('>') + 1;
+      const end = tmpl.lastIndexOf('<');
+      if (start > 0 && end > start) {
+        const run = Function(tmpl.substring(start, end));
+        run();
       }
-      document.body.appendChild(frag);
     }
 
     return data;
