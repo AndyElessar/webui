@@ -57,8 +57,13 @@ pub(crate) fn search_state(
         "sortOptions".into(),
         Value::Array(catalog::sort_options_json(sort, "/search", query)),
     );
-    state.insert("allActiveClass".into(), Value::String("active".to_string()));
+    state.insert("allActive".into(), Value::Bool(true));
+    state.insert(
+        "currentCategoryLabel".into(),
+        Value::String("All".to_string()),
+    );
     state.insert("query".into(), Value::String(query.to_string()));
+    state.insert("searchQuery".into(), Value::String(query.to_string()));
     state.insert("resultsCount".into(), serde_json::json!(products.len()));
     state.insert("activeCategory".into(), Value::String(String::new()));
     Value::Object(state)
@@ -115,8 +120,9 @@ pub(crate) fn category_state(
             query,
         )),
     );
-    state.insert("allActiveClass".into(), Value::String(String::new()));
+    state.insert("allActive".into(), Value::Bool(false));
     state.insert("query".into(), Value::String(query.to_string()));
+    state.insert("searchQuery".into(), Value::String(query.to_string()));
     state.insert("resultsCount".into(), serde_json::json!(products.len()));
     state.insert("activeCategory".into(), Value::String(category.to_string()));
     Some(Value::Object(state))
