@@ -328,6 +328,78 @@ impl HtmlParser {
         Ok(())
     }
 
+    /// Scan CSS text for `/* ... */` comments that contain exactly one
+    /// handlebars expression (e.g. `/*{{{tokens.light}}}*/`). Replace
+    /// each matching comment with a signal fragment and keep everything
+    /// else as raw CSS.
+    ///
+    /// A comment is a "signal placeholder" when:
+    /// 1. Its trimmed inner text parses to exactly one signal fragment.
+    /// 2. There is no other text around the signal inside the comment.
+    ///
+    /// Non-matching comments and all non-comment CSS are emitted as raw.
+    fn extract_style_comment_signals(
+        &mut self,
+        css: &str,
+        fragments: &mut Vec<WebUIFragment>,
+    ) -> Result<()> {
+        let bytes = css.as_bytes();
+        let len = bytes.len();
+        let mut pos = 0;
+
+        while pos < len {
+            // Find the next comment opening
+            let Some(open) = css[pos..].find("/*") else {
+                // No more comments — emit remaining CSS as raw
+                self.add_raw_fragment(&css[pos..]);
+                break;
+            };
+            let open = pos + open;
+
+            // Find the matching close
+            let Some(close_offset) = css[open + 2..].find("*/") else {
+                // Unterminated comment — emit rest as raw
+                self.add_raw_fragment(&css[pos..]);
+                break;
+            };
+            let close = open + 2 + close_offset;
+            let after_close = close + 2;
+
+            // Extract and trim the inner text of the comment
+            let inner = css[open + 2..close].trim();
+
+            // Try to parse the inner text with the handlebars parser.
+            // Accept only if it produces exactly one signal fragment.
+            let is_signal = if !inner.is_empty() {
+                match self.handlebars_parser.parse(inner) {
+                    Ok(ref parsed) if parsed.len() == 1 => {
+                        matches!(parsed[0].fragment.as_ref(), Some(Fragment::Signal(_)))
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            if is_signal {
+                // Emit CSS before the comment as raw
+                self.add_raw_fragment(&css[pos..open]);
+
+                // Emit the signal fragment (re-parse to extract it)
+                let parsed = self.handlebars_parser.parse(inner)?;
+                self.add_fragment(parsed.into_iter().next().unwrap_or_default(), fragments);
+            } else {
+                // Not a signal placeholder — emit everything including
+                // the comment as raw CSS
+                self.add_raw_fragment(&css[pos..after_close]);
+            }
+
+            pos = after_close;
+        }
+
+        Ok(())
+    }
+
     /// Process all non-structural child nodes inside an element-like container.
     fn process_content_children(
         &mut self,
@@ -337,7 +409,6 @@ impl HtmlParser {
     ) -> Result<()> {
         self.process_children_with_source_gaps(node, source, fragments, true)
     }
-
     /// Process an HTML node to generate WebUI fragments.
     fn process_html_node(
         &mut self,
@@ -400,13 +471,15 @@ impl HtmlParser {
                 }
             }
             "style_element" => {
-                // Process inline CSS
+                // Process inline CSS — extract tokens and recognise
+                // comment-delimited signal placeholders (e.g. /*{{{tokens.light}}}*/).
+                self.add_raw_fragment("<style>");
                 for child in node.named_children(&mut node.walk()) {
                     if child.kind() == "raw_text" {
                         let style_content = &source[child.start_byte()..child.end_byte()];
-                        let processed_css = self.css_parser.parse_inline_css(style_content)?;
 
-                        // Single parse: extract both token usages and definitions
+                        // Single parse: extract both token usages and definitions.
+                        // This must run on the *original* style source, unmodified.
                         if let Ok((tokens, defs)) = self
                             .css_parser
                             .extract_tokens_and_definitions(style_content)
@@ -415,11 +488,13 @@ impl HtmlParser {
                             self.token_definitions.extend(defs);
                         }
 
-                        // Add the style tag with processed CSS
-                        let style_tag = format!("<style>{}</style>", processed_css);
-                        self.add_raw_fragment(&style_tag);
+                        // Scan for CSS comments that contain exactly one
+                        // handlebars expression. Replace those comments with
+                        // signal fragments; leave everything else as raw CSS.
+                        self.extract_style_comment_signals(style_content, fragments)?;
                     }
                 }
+                self.add_raw_fragment("</style>");
             }
             "text" | "raw_text" => {
                 let content = &source[node.start_byte()..node.end_byte()];
@@ -3772,5 +3847,217 @@ mod tests {
                 "outlet should NOT be inside for-loop body: {for_frags:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_style_element_with_handlebars_signal() {
+        let mut parser = HtmlParser::new();
+        let html = r#"<html><head><style>
+:root {
+    /*{{{tokens.light}}}*/
+}
+</style></head><body></body></html>"#;
+
+        let result = parser.parse("test.html", html);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fragment_records = parser.into_fragment_records();
+
+        // Comment-delimited signal: the /* */ are stripped, signal emitted.
+        assert_stream!(
+            fragment_records,
+            "test.html",
+            [
+                raw("<html><head><style>\n:root {\n    "),
+                signal_raw("tokens.light"),
+                raw("\n}\n</style>"),
+                signal_raw("head_end"),
+                raw("</head><body>"),
+                signal_raw("body_start"),
+                signal_raw("body_end"),
+                raw("</body></html>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_style_comment_signal_with_spaces() {
+        let mut parser = HtmlParser::new();
+        let html = r#"<html><head><style>
+:root {
+    /* {{{tokens.light}}} */
+}
+</style></head><body></body></html>"#;
+
+        let result = parser.parse("test.html", html);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fragment_records = parser.into_fragment_records();
+
+        // Spaces inside comment are trimmed before parsing.
+        assert_stream!(
+            fragment_records,
+            "test.html",
+            [
+                raw("<html><head><style>\n:root {\n    "),
+                signal_raw("tokens.light"),
+                raw("\n}\n</style>"),
+                signal_raw("head_end"),
+                raw("</head><body>"),
+                signal_raw("body_start"),
+                signal_raw("body_end"),
+                raw("</body></html>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_style_comment_signal_double_brace() {
+        let mut parser = HtmlParser::new();
+        let html = "<html><head><style>/*{{themeCss}}*/</style></head><body></body></html>";
+
+        let result = parser.parse("test.html", html);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fragment_records = parser.into_fragment_records();
+
+        // Double-brace in a comment is also valid.
+        assert_stream!(
+            fragment_records,
+            "test.html",
+            [
+                raw("<html><head><style>"),
+                signal("themeCss"),
+                raw("</style>"),
+                signal_raw("head_end"),
+                raw("</head><body>"),
+                signal_raw("body_start"),
+                signal_raw("body_end"),
+                raw("</body></html>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_style_comment_with_extra_text_stays_raw() {
+        let mut parser = HtmlParser::new();
+        // Extra text around the signal inside the comment → not a placeholder
+        let html = "<html><head><style>/* theme: {{token}} */</style></head><body></body></html>";
+
+        let result = parser.parse("test.html", html);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fragment_records = parser.into_fragment_records();
+
+        assert_stream!(
+            fragment_records,
+            "test.html",
+            [
+                raw("<html><head><style>/* theme: {{token}} */</style>"),
+                signal_raw("head_end"),
+                raw("</head><body>"),
+                signal_raw("body_start"),
+                signal_raw("body_end"),
+                raw("</body></html>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_style_comment_with_multiple_signals_stays_raw() {
+        let mut parser = HtmlParser::new();
+        // Two signals in one comment → not a placeholder
+        let html = "<html><head><style>/*{{a}}{{b}}*/</style></head><body></body></html>";
+
+        let result = parser.parse("test.html", html);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fragment_records = parser.into_fragment_records();
+
+        assert_stream!(
+            fragment_records,
+            "test.html",
+            [
+                raw("<html><head><style>/*{{a}}{{b}}*/</style>"),
+                signal_raw("head_end"),
+                raw("</head><body>"),
+                signal_raw("body_start"),
+                signal_raw("body_end"),
+                raw("</body></html>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_style_bare_handlebars_stays_raw() {
+        let mut parser = HtmlParser::new();
+        // Handlebars outside a CSS comment must NOT be parsed as signals.
+        let html =
+            "<html><head><style>body { color: {{textColor}}; }</style></head><body></body></html>";
+
+        let result = parser.parse("test.html", html);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fragment_records = parser.into_fragment_records();
+
+        assert_stream!(
+            fragment_records,
+            "test.html",
+            [
+                raw("<html><head><style>body { color: {{textColor}}; }</style>"),
+                signal_raw("head_end"),
+                raw("</head><body>"),
+                signal_raw("body_start"),
+                signal_raw("body_end"),
+                raw("</body></html>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_style_mixed_css_and_comment_signal() {
+        let mut parser = HtmlParser::new();
+        let html = r#"<html><head><style>
+  .a { color: red; }
+  /*{{themeCss}}*/
+  .b { color: blue; }
+</style></head><body></body></html>"#;
+
+        let result = parser.parse("test.html", html);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fragment_records = parser.into_fragment_records();
+
+        assert_stream!(
+            fragment_records,
+            "test.html",
+            [
+                raw("<html><head><style>\n  .a { color: red; }\n  "),
+                signal("themeCss"),
+                raw("\n  .b { color: blue; }\n</style>"),
+                signal_raw("head_end"),
+                raw("</head><body>"),
+                signal_raw("body_start"),
+                signal_raw("body_end"),
+                raw("</body></html>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_style_element_plain_css_unchanged() {
+        let mut parser = HtmlParser::new();
+        let html = "<html><head><style>body { margin: 0; }</style></head><body></body></html>";
+
+        let result = parser.parse("test.html", html);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fragment_records = parser.into_fragment_records();
+
+        // Plain CSS with no handlebars should remain as a single raw fragment.
+        assert_stream!(
+            fragment_records,
+            "test.html",
+            [
+                raw("<html><head><style>body { margin: 0; }</style>"),
+                signal_raw("head_end"),
+                raw("</head><body>"),
+                signal_raw("body_start"),
+                signal_raw("body_end"),
+                raw("</body></html>"),
+            ]
+        );
     }
 }
