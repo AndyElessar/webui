@@ -162,6 +162,9 @@ importers:
         specifier: ^5.1.0
         version: 5.2.1
     devDependencies:
+      '@microsoft/webui-examples-theme':
+        specifier: workspace:*
+        version: link:../../../packages/webui-examples-theme
       '@microsoft/webui-framework':
         specifier: workspace:*
         version: link:../../../packages/webui-framework
@@ -189,6 +192,9 @@ importers:
 
   examples/app/hello-world:
     devDependencies:
+      '@microsoft/webui-examples-theme':
+        specifier: workspace:*
+        version: link:../../../packages/webui-examples-theme
       '@playwright/test':
         specifier: 'catalog:'
         version: 1.58.2
@@ -244,6 +250,9 @@ importers:
       '@microsoft/fast-html':
         specifier: 'catalog:'
         version: 1.0.0-alpha.39(@microsoft/fast-element@2.10.2)
+      '@microsoft/webui-examples-theme':
+        specifier: workspace:*
+        version: link:../../../packages/webui-examples-theme
       esbuild:
         specifier: 'catalog:'
         version: 0.27.3
@@ -328,6 +337,8 @@ importers:
   packages/webui-darwin-arm64: {}
 
   packages/webui-darwin-x64: {}
+
+  packages/webui-examples-theme: {}
 
   packages/webui-framework:
     devDependencies:

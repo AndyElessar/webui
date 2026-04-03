@@ -48,6 +48,12 @@ pub struct ServeArgs {
     /// Port of the user's API server to proxy route requests to
     #[arg(long)]
     pub api_port: Option<u16>,
+
+    /// Design token theme: a path to a JSON file or an npm package name
+    /// (e.g., `@microsoft/webui-examples-theme`). Resolved from node_modules
+    /// when the value doesn't point to a file on disk.
+    #[arg(long)]
+    pub theme: Option<String>,
 }
 
 /// Resolved paths for `webui serve`.
@@ -279,10 +285,33 @@ fn run(args: &ServeArgs) -> Result<()> {
         None
     };
 
+    // Load and resolve theme tokens once at startup
+    let token_css: Option<HashMap<String, String>> = match &args.theme {
+        Some(theme) => {
+            let token_file = load_theme(theme)?;
+            // We need the protocol to know which tokens are required.
+            // Do a quick build to get protocol.tokens, then resolve.
+            let probe_options = args.app_args.to_build_options(&paths.app_dir);
+            let probe = webui::build(probe_options).with_context(|| "Build failed")?;
+            let resolved = webui_tokens::resolve_tokens(&probe.protocol.tokens, &token_file)
+                .with_context(|| "Token resolution failed")?;
+            for warning in &resolved.warnings {
+                eprintln!(
+                    "  {} {}",
+                    console::style("⚠").yellow(),
+                    console::style(warning).dim()
+                );
+            }
+            Some(resolved.css)
+        }
+        None => None,
+    };
+
     let render_config = RenderConfig {
         app_args: args.app_args.clone(),
         app_dir: paths.app_dir.clone(),
         state_file: paths.state_file.clone(),
+        token_css: token_css.clone(),
     };
 
     output::header("WebUI Dev Server");
@@ -294,6 +323,11 @@ fn run(args: &ServeArgs) -> Result<()> {
     match &paths.serve_dir {
         Some(serve_dir) => output::field("ServeDir", &serve_dir.display()),
         None => output::field("ServeDir", &"(disabled)"),
+    }
+    if let Some(ref theme) = args.theme {
+        output::field("Theme", theme);
+    } else {
+        output::field("Theme", &"(none)");
     }
     output::field("Entry", &args.app_args.entry);
     output::field("Port", &args.port);
@@ -310,7 +344,7 @@ fn run(args: &ServeArgs) -> Result<()> {
 
     ensure_local_port_available(args.port)?;
 
-    // Initial build + render
+    // Initial build + render (uses pre-resolved token_css)
     let initial_result = build_and_render(&render_config, hmr_backend.as_deref())?;
     output::success("Initial build and render complete");
 
@@ -355,6 +389,7 @@ fn run(args: &ServeArgs) -> Result<()> {
         assets_dir: paths.serve_dir,
         api_port: args.api_port,
         plugin: args.app_args.plugin.clone(),
+        token_css: render_config.token_css.clone(),
     });
 
     let has_api_proxy = server_context.api_port.is_some();
@@ -416,11 +451,23 @@ fn map_bind_error(port: u16, bind_addr: &str, error: std::io::Error) -> anyhow::
     anyhow::anyhow!("Failed to bind to {bind_addr}: {error}")
 }
 
+/// Load and resolve a theme file from a `--theme` CLI value.
+fn load_theme(theme: &str) -> Result<webui_tokens::TokenFile> {
+    let cwd = std::env::current_dir().with_context(|| "Failed to determine current directory")?;
+    let resolved = webui_tokens::resolve_theme_path(theme, &cwd)
+        .with_context(|| format!("Failed to resolve theme: {theme}"))?;
+    webui_tokens::load_token_file(&resolved)
+        .with_context(|| format!("Failed to load theme file: {}", resolved.display()))
+}
+
 #[derive(Clone)]
 struct RenderConfig {
     app_args: AppArgs,
     app_dir: PathBuf,
     state_file: Option<PathBuf>,
+    /// Pre-resolved per-theme CSS strings. Computed once at startup and reused
+    /// for every build-and-render cycle (initial + file-watcher rebuilds).
+    token_css: Option<HashMap<String, String>>,
 }
 
 /// Result of a build-and-render cycle.
@@ -439,7 +486,7 @@ fn build_and_render(
     let build_options = config.app_args.to_build_options(&config.app_dir);
     let build_result = webui::build(build_options).with_context(|| "Build failed")?;
 
-    let state: Value = match &config.state_file {
+    let mut state: Value = match &config.state_file {
         Some(path) => {
             let json = fs::read_to_string(path)
                 .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -448,6 +495,11 @@ fn build_and_render(
         }
         None => Value::Object(serde_json::Map::new()),
     };
+
+    // Inject pre-resolved token CSS into state
+    if let Some(ref token_css) = config.token_css {
+        webui_tokens::inject_token_css(&mut state, token_css);
+    }
 
     // Render to memory
     let mut writer = MemoryWriter::with_capacity(4096);
@@ -504,6 +556,8 @@ struct ServerContext {
     assets_dir: Option<PathBuf>,
     api_port: Option<u16>,
     plugin: Option<String>,
+    /// Pre-resolved token CSS keyed by theme name, injected into state at render time.
+    token_css: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,21 +615,36 @@ async fn fetch_api_state(api_port: u16, path: &str) -> Result<Value, String> {
 
 /// Resolve state for a request: try API proxy first, then fall back to file state.
 async fn resolve_state(context: &ServerContext, request_path: &str) -> Value {
-    if let Some(api_port) = context.api_port {
+    let mut state = if let Some(api_port) = context.api_port {
         match fetch_api_state(api_port, request_path).await {
-            Ok(state) => return state,
+            Ok(state) => state,
             Err(e) => {
                 eprintln!("  {} {e}", console::style("\u{26a0}").yellow());
+                context
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.state_data.clone())
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
             }
         }
+    } else {
+        context
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.state_data.clone())
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+    };
+
+    // Inject pre-resolved token CSS into state so signals like
+    // /*{{{tokens.light}}}*/ resolve at render time, regardless of
+    // whether state came from a static file or the API server.
+    if let Some(ref token_css) = context.token_css {
+        webui_tokens::inject_token_css(&mut state, token_css);
     }
 
-    context
-        .state
-        .lock()
-        .ok()
-        .and_then(|s| s.state_data.clone())
-        .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+    state
 }
 
 /// Render a full HTML page using route matching from `route_path` and state lookup from
@@ -1082,6 +1151,7 @@ mod tests {
             },
             app_dir: app.path().to_path_buf(),
             state_file: Some(app.path().join("state.json")),
+            token_css: None,
         };
         let hmr = PollingHmrBackend::new("/hmr", 1000);
         let BuildRenderResult { html, .. } = build_and_render(&config, Some(&hmr)).unwrap();
@@ -1105,6 +1175,7 @@ mod tests {
             },
             app_dir: app.path().to_path_buf(),
             state_file: Some(app.path().join("state.json")),
+            token_css: None,
         };
         let hmr = PollingHmrBackend::new("/hmr", 1000);
         let BuildRenderResult { html, .. } = build_and_render(&config, Some(&hmr)).unwrap();
@@ -1125,6 +1196,7 @@ mod tests {
             },
             app_dir: app.path().to_path_buf(),
             state_file: Some(app.path().join("state.json")),
+            token_css: None,
         };
         let BuildRenderResult { html, .. } = build_and_render(&config, None).unwrap();
         assert!(!html.contains("/hmr"));
@@ -1157,6 +1229,7 @@ mod tests {
             },
             app_dir: app.path().to_path_buf(),
             state_file: Some(app.path().join("state.json")),
+            token_css: None,
         };
         let hmr = PollingHmrBackend::new("/hmr", 1000);
         let result = build_and_render(&config, Some(&hmr));
@@ -1177,6 +1250,7 @@ mod tests {
             },
             app_dir: app.path().to_path_buf(),
             state_file: None,
+            token_css: None,
         };
         let result = build_and_render(&config, None).unwrap();
         assert!(result.html.contains("<h1>Hello</h1>"));
@@ -1196,6 +1270,7 @@ mod tests {
             },
             app_dir: app.path().to_path_buf(),
             state_file: Some(app.path().join("state.json")),
+            token_css: None,
         };
         let hmr = PollingHmrBackend::new("/hmr", 1000);
         let result = build_and_render(&config, Some(&hmr));
@@ -1450,6 +1525,7 @@ mod tests {
             },
             app_dir,
             state_file: Some(manifest_dir.join("../../examples/app/hello-world/data/state.json")),
+            token_css: None,
         };
         let hmr = PollingHmrBackend::new("/hmr", 1000);
         let BuildRenderResult { html, .. } = build_and_render(&config, Some(&hmr)).unwrap();
@@ -1491,6 +1567,7 @@ mod tests {
             assets_dir: None,
             api_port: None,
             plugin: None,
+            token_css: None,
         });
 
         let app = actix_test::init_service(
