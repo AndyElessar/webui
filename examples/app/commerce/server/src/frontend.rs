@@ -95,10 +95,12 @@ impl FrontendRuntime {
     #[must_use]
     pub fn serve_asset(&self, relative: &str) -> Option<HttpResponse> {
         if let Some(css) = self.css_files.get(relative) {
+            // CSS filenames are not content-hashed, so use a moderate
+            // max-age with revalidation instead of immutable.
             return Some(
                 HttpResponse::Ok()
                     .content_type("text/css; charset=utf-8")
-                    .insert_header(("Cache-Control", "public, max-age=86400"))
+                    .insert_header(("Cache-Control", "public, max-age=86400, must-revalidate"))
                     .body(css.clone()),
             );
         }

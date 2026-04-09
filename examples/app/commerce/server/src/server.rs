@@ -21,6 +21,10 @@ struct CartResponseOptions<'a> {
 }
 
 pub(crate) fn configure_app(cfg: &mut web::ServiceConfig) {
+    cfg.route(
+        "/_image/{stem}",
+        web::get().to(crate::image_proxy::serve_image),
+    );
     cfg.service(web::scope("/cart").configure(configure_cart_routes));
     configure_frontend_routes(cfg);
 }
@@ -47,13 +51,14 @@ async fn handle_frontend_request(
     let route_params = data.frontend().collect_route_params(context.route_path());
     let stable_path = cart::without_cart(context.request_path());
     let cart_state = build_cart_state(&context.cart_read().cart, data.catalog(), &stable_path);
-    let page_state = state::build_route_state(&state::RouteStateRequest {
+    let is_partial = context.wants_json();
+    let (page_state, image_preloads) = state::build_route_state(&state::RouteStateRequest {
         catalog: data.catalog(),
         route_path: context.route_path(),
         params: &route_params,
         request_path: context.request_path(),
         cart_state: &cart_state,
-        is_partial: context.wants_json(),
+        is_partial,
     })
     .ok_or(ServerError::NotFound)?;
 
@@ -66,7 +71,11 @@ async fn handle_frontend_request(
         .frontend()
         .render_html(context.route_path(), &page_state, &nonce)
         .map_err(ServerError::RenderFailed)?;
-    Ok(html_response(&context, html, &nonce))
+    Ok(html_response(
+        &context,
+        inject_head_preload_tags(html, &image_preloads),
+        &nonce,
+    ))
 }
 
 async fn add_to_cart(
@@ -187,6 +196,70 @@ fn html_response(context: &RequestContext, html: String, nonce: &str) -> HttpRes
     builder.body(html)
 }
 
+fn inject_head_preload_tags(mut html: String, image_urls: &[String]) -> String {
+    let Some(head_end) = html.find("</head>") else {
+        return html;
+    };
+
+    let css_hrefs = css_preload_hrefs_from_html(&html);
+    let preloads = build_head_preload_tags(image_urls, &css_hrefs);
+    if preloads.is_empty() {
+        return html;
+    }
+
+    html.insert_str(head_end, &preloads);
+    html
+}
+
+fn css_preload_hrefs_from_html(html: &str) -> Vec<String> {
+    const STYLESHEET_LINK: &str = r#"<link rel="stylesheet" href=""#;
+
+    let mut hrefs = Vec::new();
+    let mut remaining = html;
+    while let Some(start) = remaining.find(STYLESHEET_LINK) {
+        let href_start = start + STYLESHEET_LINK.len();
+        let after_marker = &remaining[href_start..];
+        let Some(end) = after_marker.find('"') else {
+            break;
+        };
+        let href = &after_marker[..end];
+        if hrefs.iter().all(|existing| existing != href) {
+            hrefs.push(href.to_string());
+        }
+        remaining = &after_marker[end + 1..];
+    }
+
+    hrefs
+}
+
+/// Build SSR-only `<link rel="preload">` tags that match the initial HTML.
+/// The router removes these managed tags on SPA navigations so preloads never
+/// leak across routes.
+fn build_head_preload_tags(image_urls: &[String], css_hrefs: &[String]) -> String {
+    let capacity = 80 + css_hrefs.len() * 90 + image_urls.len() * 120;
+    let mut buf = String::with_capacity(capacity);
+
+    for href in css_hrefs {
+        buf.push_str(r#"<link rel="preload" as="style" href=""#);
+        buf.push_str(href);
+        buf.push_str(r#"" data-webui-ssr-preload="style">"#);
+    }
+
+    buf.push_str(r#"<link rel="modulepreload" href="/index.js" data-webui-ssr-preload="script">"#);
+
+    for (i, url) in image_urls.iter().enumerate() {
+        buf.push_str(r#"<link rel="preload" as="image" href=""#);
+        buf.push_str(url);
+        if i == 0 {
+            buf.push_str(r#"" fetchpriority="high" data-webui-ssr-preload="image">"#);
+        } else {
+            buf.push_str(r#"" data-webui-ssr-preload="image">"#);
+        }
+    }
+
+    buf
+}
+
 fn cart_response(
     wants_json: bool,
     catalog: &Catalog,
@@ -250,6 +323,10 @@ mod tests {
         let response = test::call_service(&app, request).await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get(header::LINK).is_none(),
+            "SSR preload tags should be emitted in <head>, not the HTTP Link header"
+        );
         let body = match to_bytes(response.into_body()).await {
             Ok(body) => body,
             Err(error) => panic!("{error}"),
@@ -261,6 +338,13 @@ mod tests {
 
         assert!(html.contains("mp-page-search"));
         assert!(html.contains("mp-navbar"));
+        assert!(html.contains(r#"data-webui-ssr-preload="style""#));
+        assert!(html.contains(r#"href="/mp-app.css""#));
+        assert!(html.contains(r#"href="/_image/t-shirt-1?w=640&q=75""#));
+        assert!(
+            !html.contains(r#"\"data-webui-ssr-preload\""#),
+            "server-only preload tags should not leak into serialized client state"
+        );
     }
 
     #[actix_web::test]
@@ -317,6 +401,7 @@ mod tests {
         assert!(json["state"].get("cartItems").is_none());
         assert!(json["state"].get("cartItemCount").is_none());
         assert!(json["state"].get("page").is_none());
+        assert!(json["state"].get("head_end").is_none());
     }
 
     #[actix_web::test]
@@ -396,5 +481,58 @@ mod tests {
         let response = test::call_service(&app, request).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn image_proxy_serves_cached_image() {
+        let state = test_state();
+        let expected = state
+            .image_cache()
+            .get("baby-cap-white", 384)
+            .unwrap_or_else(|| panic!("expected cached baby-cap-white image"));
+        let app = test::init_service(App::new().app_data(state).configure(configure_app)).await;
+
+        let request = TestRequest::get()
+            .uri("/_image/baby-cap-white?w=256&q=75")
+            .to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(content_type, "image/avif");
+
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(cache_control.contains("immutable"));
+
+        let body = match to_bytes(response.into_body()).await {
+            Ok(body) => body,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(
+            body.as_ref(),
+            expected.as_ref(),
+            "proxy response should return the exact cached bytes for the snapped width"
+        );
+    }
+
+    #[actix_web::test]
+    async fn image_proxy_returns_404_for_unknown_image() {
+        let app =
+            test::init_service(App::new().app_data(test_state()).configure(configure_app)).await;
+
+        let request = TestRequest::get()
+            .uri("/_image/no-such-image?w=96&q=75")
+            .to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
