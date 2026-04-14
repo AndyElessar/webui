@@ -41,12 +41,14 @@ extends:
       networkIsolationPolicy: Permissive
     stages:
 
-    # ── Download pre-built release artifacts and deploy ──
-    - stage: Package
+    # ── Stage 1: Lightweight version check (runs every hour, ~1-2 min) ──
+    # This stage is separate so that when no deployment is needed, the
+    # heavyweight Package stage (with all its 1ES SDL tasks) is skipped
+    # entirely — avoiding ~30 min of unnecessary agent provisioning and
+    # compliance scans on every hourly no-op run.
+    - stage: Check
       jobs:
-
-      # ── Job 1: Resolve the latest release tag and check registry status ──
-      - job: NeedsDeployment
+      - job: CheckVersion
         steps:
           - checkout: self
             persistCredentials: "true"
@@ -60,8 +62,7 @@ extends:
               downloadPath: '$(System.ArtifactsDirectory)'
 
           # Extract the version number from the downloaded .crate filename,
-          # e.g. microsoft-webui-0.0.3.crate → 0.0.3, and expose it as output
-          # variables for the Deploy job.
+          # e.g. microsoft-webui-0.0.3.crate → 0.0.3
           - script: |
               CRATE_FILE=$(ls "$(System.ArtifactsDirectory)"/microsoft-webui-*.crate 2>/dev/null | head -1)
               if [ -z "$CRATE_FILE" ]; then
@@ -76,42 +77,34 @@ extends:
             displayName: Extract version from downloaded artifacts
             name: resolveTag
 
-          # Check whether this version is already deployed to all registries.
-          # Sets needsDeployment=true if any of npm or crates.io do not yet carry
-          # the version — so a partial deployment still reruns the template.
+          # Check whether this version has already been deployed by looking
+          # for a "deployed/vX.Y.Z" git tag. This avoids external network
+          # calls to npm/crates.io which are unreachable from 1ES agents.
+          # The Deploy job pushes this tag after a successful deployment.
           - script: |
+              set -euo pipefail
               VERSION="$(releaseVersion)"
-              NEEDS_DEPLOYMENT=false
+              DEPLOY_TAG="deployed/v${VERSION}"
 
-              # npm
-              if npm view "@microsoft/webui@${VERSION}" version 2>/dev/null | grep -qxF "${VERSION}"; then
-                echo "npm @microsoft/webui@${VERSION} already deployed"
+              git fetch --tags --quiet
+              if git tag -l "${DEPLOY_TAG}" | grep -q .; then
+                echo "${DEPLOY_TAG} tag exists — version ${VERSION} already deployed"
+                echo "##vso[task.setvariable variable=needsDeployment;isOutput=true]false"
               else
-                echo "npm @microsoft/webui@${VERSION} not yet deployed"
-                NEEDS_DEPLOYMENT=true
+                echo "${DEPLOY_TAG} tag not found — version ${VERSION} needs deployment"
+                echo "##vso[task.setvariable variable=needsDeployment;isOutput=true]true"
               fi
-
-              # crates.io
-              CRATE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-                -H "User-Agent: webui-cd-pipeline (microsoft/webui)" \
-                "https://crates.io/api/v1/crates/microsoft-webui/${VERSION}")
-              if [ "$CRATE_STATUS" = "200" ]; then
-                echo "crates.io microsoft-webui ${VERSION} already deployed"
-              else
-                echo "crates.io microsoft-webui ${VERSION} not yet deployed (HTTP ${CRATE_STATUS})"
-                NEEDS_DEPLOYMENT=true
-              fi
-
-              echo "##vso[task.setvariable variable=needsDeployment;isOutput=true]${NEEDS_DEPLOYMENT}"
             displayName: Check if already deployed
             name: deploymentCheck
 
-      # ── Job 2: Download artifacts and deploy (skipped if all already deployed) ──
+    # ── Stage 2: Download artifacts and deploy (entirely skipped if already deployed) ──
+    - stage: Package
+      dependsOn: Check
+      condition: eq(dependencies.Check.outputs['CheckVersion.deploymentCheck.needsDeployment'], 'true')
+      variables:
+        releaseTag: $[ stageDependencies.Check.CheckVersion.outputs['resolveTag.releaseTag'] ]
+      jobs:
       - job: Deploy
-        dependsOn: NeedsDeployment
-        condition: eq(dependencies.NeedsDeployment.outputs['deploymentCheck.needsDeployment'], 'true')
-        variables:
-          releaseTag: $[ dependencies.NeedsDeployment.outputs['resolveTag.releaseTag'] ]
         steps:
           - checkout: self
             persistCredentials: "true"
@@ -137,3 +130,14 @@ extends:
             displayName: Separate release artifacts
 
           - template: WebUI.Release.PipelineTemplate.yml@webuiPipelines  # Template reference
+
+          # Mark this version as deployed so future pipeline runs skip it.
+          # Uses the releaseTag stage variable (e.g. "v0.0.8") to create
+          # a "deployed/v0.0.8" tag and push it back to the repo.
+          - script: |
+              set -euo pipefail
+              DEPLOY_TAG="deployed/$(releaseTag)"
+              echo "Tagging successful deployment: ${DEPLOY_TAG}"
+              git tag "${DEPLOY_TAG}"
+              git push origin "${DEPLOY_TAG}"
+            displayName: Tag successful deployment
