@@ -148,6 +148,27 @@ pub struct WebUIFragmentAttribute {
 }
 ```
 
+##### Attribute Name Mapping
+
+Some HTML attributes use concatenated lowercase names that do not follow
+standard camelCase-to-kebab-case conversion rules. The canonical lookup
+table lives in `webui-protocol` (`webui_protocol::attrs`) and covers two
+categories:
+
+1. **Multi-word ARIA attributes** — e.g., `aria-describedby` ↔
+   `ariaDescribedBy`, `aria-activedescendant` ↔ `ariaActiveDescendant`,
+   per the [ARIAMixin](https://w3c.github.io/aria/#ARIAMixin) specification.
+2. **HTML global/element attributes** — e.g., `readonly` ↔ `readOnly`,
+   `tabindex` ↔ `tabIndex`, `contenteditable` ↔ `contentEditable`.
+
+The handler and parser both call into `webui_protocol::attrs` — there is
+no duplicated table. The framework (`toKebabCase` in `decorators.ts`)
+maintains a TypeScript copy of the same table for client-side use.
+
+Attributes that follow standard conversion (e.g., `aria-label` ↔ `ariaLabel`,
+`data-title` ↔ `dataTitle`) use the generic algorithm and do not require
+the lookup table.
+
 #### Plugin Fragment
 Plugin fragments carry opaque data from parser plugins to handler plugins. WebUI does
 not interpret this data — each parser/handler plugin pair defines its own binary contract.

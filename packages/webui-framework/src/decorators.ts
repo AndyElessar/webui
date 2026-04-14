@@ -12,9 +12,75 @@
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Map of camelCase property names to their HTML attribute names.
+ *
+ * Covers two categories of irregular mappings:
+ *
+ * 1. Multi-word ARIA attributes — concatenated lowercase after `aria-`
+ *    (e.g., `ariaDescribedBy` → `aria-describedby`), per the ARIAMixin spec.
+ * 2. HTML global/element attributes — concatenated lowercase attribute names
+ *    with camelCase property counterparts (e.g., `readOnly` → `readonly`).
+ */
+const propertyToAttribute: Record<string, string> = Object.assign(Object.create(null) as Record<string, string>, {
+  // --- ARIA (ARIAMixin) ---
+  ariaActiveDescendant: 'aria-activedescendant',
+  ariaAutoComplete: 'aria-autocomplete',
+  ariaBrailleLabel: 'aria-braillelabel',
+  ariaBrailleRoleDescription: 'aria-brailleroledescription',
+  ariaColCount: 'aria-colcount',
+  ariaColIndex: 'aria-colindex',
+  ariaColIndexText: 'aria-colindextext',
+  ariaColSpan: 'aria-colspan',
+  ariaDescribedBy: 'aria-describedby',
+  ariaDropEffect: 'aria-dropeffect',
+  ariaErrorMessage: 'aria-errormessage',
+  ariaFlowTo: 'aria-flowto',
+  ariaHasPopup: 'aria-haspopup',
+  ariaKeyShortcuts: 'aria-keyshortcuts',
+  ariaLabelledBy: 'aria-labelledby',
+  ariaMultiLine: 'aria-multiline',
+  ariaMultiSelectable: 'aria-multiselectable',
+  ariaPosInSet: 'aria-posinset',
+  ariaReadOnly: 'aria-readonly',
+  ariaRoleDescription: 'aria-roledescription',
+  ariaRowCount: 'aria-rowcount',
+  ariaRowIndex: 'aria-rowindex',
+  ariaRowIndexText: 'aria-rowindextext',
+  ariaRowSpan: 'aria-rowspan',
+  ariaSetSize: 'aria-setsize',
+  ariaValueMax: 'aria-valuemax',
+  ariaValueMin: 'aria-valuemin',
+  ariaValueNow: 'aria-valuenow',
+  ariaValueText: 'aria-valuetext',
+  // --- HTML global/element attributes ---
+  accessKey: 'accesskey',
+  autoCapitalize: 'autocapitalize',
+  contentEditable: 'contenteditable',
+  crossOrigin: 'crossorigin',
+  dirName: 'dirname',
+  fetchPriority: 'fetchpriority',
+  formAction: 'formaction',
+  formEnctype: 'formenctype',
+  formMethod: 'formmethod',
+  formNoValidate: 'formnovalidate',
+  formTarget: 'formtarget',
+  inputMode: 'inputmode',
+  isMap: 'ismap',
+  maxLength: 'maxlength',
+  minLength: 'minlength',
+  noModule: 'nomodule',
+  noValidate: 'novalidate',
+  readOnly: 'readonly',
+  referrerPolicy: 'referrerpolicy',
+  tabIndex: 'tabindex',
+  useMap: 'usemap',
+});
+
 /** Convert camelCase to kebab-case for attribute reflection. */
-function toKebabCase(str: string): string {
-  return str.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
+export function toKebabCase(str: string): string {
+  const mapped = propertyToAttribute[str];
+  return mapped ?? str.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
 }
 
 /**

@@ -136,47 +136,14 @@ struct WebUIProcessContext<'a> {
     nonce: Option<String>,
 }
 
-/// Convert hyphenated name to camelCase (e.g., "data-title" → "dataTitle").
-fn convert_hyphen_to_camel_case(name: &str) -> String {
-    let mut result = String::with_capacity(name.len());
-    let mut capitalize_next = false;
-    for ch in name.chars() {
-        if ch == '-' {
-            capitalize_next = true;
-        } else if capitalize_next {
-            result.extend(ch.to_uppercase());
-            capitalize_next = false;
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
-/// Convert camelCase to kebab-case (e.g., "totalContacts" → "total-contacts").
-fn camel_to_kebab(name: &str) -> String {
-    let mut result = String::with_capacity(name.len() + 4);
-    for ch in name.chars() {
-        if ch.is_uppercase() && !result.is_empty() {
-            result.push('-');
-            for lc in ch.to_lowercase() {
-                result.push(lc);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
 /// Get the component attribute name, stripping `:` prefix and converting to camelCase.
+///
+/// Uses `webui_protocol::attrs::attribute_to_camel` which handles irregular
+/// attributes (multi-word ARIA and global HTML attributes like `readonly`,
+/// `tabindex`) via the shared lookup table.
 fn component_attr_name(name: &str) -> String {
     let stripped = name.strip_prefix(':').unwrap_or(name);
-    if stripped.contains('-') {
-        convert_hyphen_to_camel_case(stripped)
-    } else {
-        stripped.to_string()
-    }
+    webui_protocol::attrs::attribute_to_camel(stripped)
 }
 
 impl WebUIHandler {
@@ -6278,5 +6245,48 @@ mod tests {
             html.contains("w['cart-panel']"),
             "rendered cart-panel template should be emitted: {html}"
         );
+    }
+
+    #[test]
+    fn test_component_attr_name_aria() {
+        // component_attr_name correctly maps ARIA attributes via the shared table
+        assert_eq!(component_attr_name("aria-describedby"), "ariaDescribedBy");
+        assert_eq!(component_attr_name("aria-labelledby"), "ariaLabelledBy");
+        assert_eq!(
+            component_attr_name("aria-activedescendant"),
+            "ariaActiveDescendant"
+        );
+        assert_eq!(component_attr_name("aria-label"), "ariaLabel");
+        assert_eq!(component_attr_name("aria-hidden"), "ariaHidden");
+    }
+
+    #[test]
+    fn test_component_attr_name_html_global() {
+        assert_eq!(component_attr_name("readonly"), "readOnly");
+        assert_eq!(component_attr_name("tabindex"), "tabIndex");
+        assert_eq!(component_attr_name("accesskey"), "accessKey");
+        assert_eq!(component_attr_name("contenteditable"), "contentEditable");
+        assert_eq!(component_attr_name("crossorigin"), "crossOrigin");
+        assert_eq!(component_attr_name("inputmode"), "inputMode");
+        assert_eq!(component_attr_name("maxlength"), "maxLength");
+        assert_eq!(component_attr_name("minlength"), "minLength");
+        assert_eq!(component_attr_name("novalidate"), "noValidate");
+        assert_eq!(component_attr_name("formaction"), "formAction");
+        assert_eq!(component_attr_name("ismap"), "isMap");
+        assert_eq!(component_attr_name("usemap"), "useMap");
+    }
+
+    #[test]
+    fn test_component_attr_name_strips_colon() {
+        assert_eq!(component_attr_name(":readonly"), "readOnly");
+        assert_eq!(component_attr_name(":aria-describedby"), "ariaDescribedBy");
+        assert_eq!(component_attr_name(":data-title"), "dataTitle");
+    }
+
+    #[test]
+    fn test_component_attr_name_regular() {
+        assert_eq!(component_attr_name("data-title"), "dataTitle");
+        assert_eq!(component_attr_name("key-hyphen"), "keyHyphen");
+        assert_eq!(component_attr_name("simple"), "simple");
     }
 }
