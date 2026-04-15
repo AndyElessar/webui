@@ -1404,10 +1404,15 @@ impl HtmlParser {
 
         let exact = self.has_element_attribute(node, "exact", source)?;
 
+        let query = self
+            .get_element_attribute(node, "query", source)?
+            .unwrap_or_default();
+
         let attrs = route_parser::RouteAttributes {
             path: path.clone(),
             component: component.clone(),
             exact,
+            query,
         };
 
         // Validate attributes (component is required)
@@ -1464,10 +1469,15 @@ impl HtmlParser {
             .unwrap_or_default();
         let exact = self.has_element_attribute(node, "exact", source)?;
 
+        let query = self
+            .get_element_attribute(node, "query", source)?
+            .unwrap_or_default();
+
         let attrs = route_parser::RouteAttributes {
             path: path.clone(),
             component: component.clone(),
             exact,
+            query,
         };
 
         route_parser::validate_attributes(&attrs)?;
@@ -4062,6 +4072,43 @@ mod tests {
         }
         if let Some(web_ui_fragment::Fragment::Route(r)) = frags[2].fragment.as_ref() {
             assert_eq!(r.path, "/contact/:id");
+        }
+    }
+
+    #[test]
+    fn test_parse_route_with_query_allowlist() {
+        let mut parser = HtmlParser::new();
+        let html =
+            r#"<route path="/compose" component="compose-page" query="action,to,subject" exact />"#;
+        parser.parse("test.html", html).expect("parse failed");
+
+        let records = parser.into_fragment_records();
+        let frags = &records["test.html"].fragments;
+        assert_eq!(frags.len(), 1);
+        match frags[0].fragment.as_ref() {
+            Some(web_ui_fragment::Fragment::Route(r)) => {
+                assert_eq!(r.path, "/compose");
+                assert_eq!(r.fragment_id, "compose-page");
+                assert!(r.exact);
+                assert_eq!(r.allowed_query, "action,to,subject");
+            }
+            other => panic!("expected Fragment::Route, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_route_without_query_has_empty_allowed_query() {
+        let mut parser = HtmlParser::new();
+        let html = r#"<route path="/profile" component="profile-page" exact />"#;
+        parser.parse("test.html", html).expect("parse failed");
+
+        let records = parser.into_fragment_records();
+        let frags = &records["test.html"].fragments;
+        match frags[0].fragment.as_ref() {
+            Some(web_ui_fragment::Fragment::Route(r)) => {
+                assert!(r.allowed_query.is_empty());
+            }
+            other => panic!("expected Fragment::Route, got {:?}", other),
         }
     }
 

@@ -202,6 +202,7 @@ In the TypeScript class: `searchInput!: HTMLInputElement;`
 - Use `exact` on leaf routes (no children)
 - Omit `exact` on parent routes that have `<outlet />`
 - Path params: `:id` (required), `:query?` (optional), `*path` (catch-all)
+- Query param allowlist: `query="action,to,subject"` — only listed params are set as component attributes (deny-by-default)
 
 ### Outlet
 
@@ -386,6 +387,25 @@ Router.start({
   },
 });
 ```
+
+### View Transitions
+
+The router wraps every client-side navigation in `document.startViewTransition()`
+automatically. **Do not** wrap `Router.navigate()` in your own `startViewTransition()`
+— that would double-transition.
+
+To customize the animation, assign `view-transition-name` to elements in your CSS
+and target them with `::view-transition-old()` / `::view-transition-new()`:
+
+```css
+.content-area { view-transition-name: content; }
+
+::view-transition-old(content) { animation: fade-out 100ms ease-out; }
+::view-transition-new(content) { animation: fade-in 150ms ease-in; }
+```
+
+The router awaits `updateCallbackDone` (not `.finished`) so rapid navigations
+supersede each other without queuing.
 
 ## CLI Commands
 
