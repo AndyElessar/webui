@@ -172,7 +172,7 @@ fn build_protocol_inner(
     entry: &str,
 ) -> Result<String, BuildError> {
     let protocol = parse_to_protocol(files, entry)?;
-    serde_json::to_string(&protocol).map_err(|e| BuildError::Protocol(e.to_string()))
+    serde_json::to_string(&protocol).map_err(BuildError::Protocol)
 }
 
 /// Create a handler with an optional plugin.
@@ -196,20 +196,17 @@ fn render_inner(
     plugin: Option<Plugin>,
 ) -> Result<String, BuildError> {
     let protocol: WebUIProtocol =
-        serde_json::from_str(protocol_json).map_err(|e| BuildError::Protocol(e.to_string()))?;
-    let state: Value =
-        serde_json::from_str(state_json).map_err(|e| BuildError::State(e.to_string()))?;
+        serde_json::from_str(protocol_json).map_err(BuildError::Protocol)?;
+    let state: Value = serde_json::from_str(state_json).map_err(BuildError::State)?;
 
     let mut writer = StringWriter::with_capacity(1024);
     let handler = create_handler(plugin)?;
-    handler
-        .render(
-            &protocol,
-            &state,
-            &RenderOptions::new(entry, request_path),
-            &mut writer,
-        )
-        .map_err(|e| BuildError::Render(e.to_string()))?;
+    handler.render(
+        &protocol,
+        &state,
+        &RenderOptions::new(entry, request_path),
+        &mut writer,
+    )?;
 
     Ok(writer.content)
 }
@@ -223,19 +220,16 @@ pub(crate) fn build_and_render_inner(
 ) -> Result<String, BuildError> {
     let protocol = parse_to_protocol(files, entry)?;
 
-    let state: Value =
-        serde_json::from_str(state_json).map_err(|e| BuildError::State(e.to_string()))?;
+    let state: Value = serde_json::from_str(state_json).map_err(BuildError::State)?;
 
     let mut writer = StringWriter::with_capacity(1024);
     let handler = create_handler(None)?;
-    handler
-        .render(
-            &protocol,
-            &state,
-            &RenderOptions::new(entry, request_path),
-            &mut writer,
-        )
-        .map_err(|e| BuildError::Render(e.to_string()))?;
+    handler.render(
+        &protocol,
+        &state,
+        &RenderOptions::new(entry, request_path),
+        &mut writer,
+    )?;
 
     Ok(writer.content)
 }
@@ -261,39 +255,33 @@ fn parse_to_protocol(
                 let css = files.get(&css_key).map(|s| s.as_str());
                 parser
                     .component_registry_mut()
-                    .register_component(tag_name, content, css)
-                    .map_err(|e| BuildError::Parse(e.to_string()))?;
+                    .register_component(tag_name, content, css)?;
             }
         }
     }
 
-    parser
-        .parse(entry, entry_html)
-        .map_err(|e| BuildError::Parse(e.to_string()))?;
+    parser.parse(entry, entry_html)?;
 
     Ok(WebUIProtocol::new(parser.into_fragment_records()))
 }
 
 /// Errors from the build-and-render pipeline.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum BuildError {
+    #[error("Entry file '{0}' not found")]
     MissingEntry(String),
-    Parse(String),
-    Protocol(String),
-    State(String),
-    Render(String),
-}
 
-impl std::fmt::Display for BuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BuildError::MissingEntry(name) => write!(f, "Entry file '{name}' not found"),
-            BuildError::Parse(msg) => write!(f, "Parse error: {msg}"),
-            BuildError::Protocol(msg) => write!(f, "Protocol JSON error: {msg}"),
-            BuildError::State(msg) => write!(f, "State JSON error: {msg}"),
-            BuildError::Render(msg) => write!(f, "Render error: {msg}"),
-        }
-    }
+    #[error("{0}")]
+    Parse(#[from] webui_parser::ParserError),
+
+    #[error("Protocol JSON error: {0}")]
+    Protocol(serde_json::Error),
+
+    #[error("State JSON error: {0}")]
+    State(serde_json::Error),
+
+    #[error("{0}")]
+    Render(#[from] webui_handler::HandlerError),
 }
 
 #[cfg(test)]
@@ -309,8 +297,7 @@ mod tests {
         );
 
         let result = build_and_render_inner(&files, r#"{"name": "WebUI"}"#, "index.html", "/");
-        assert!(result.is_ok(), "Render failed: {:?}", result);
-        assert_eq!(result.as_deref(), Ok("<h1>Hello, WebUI!</h1>"));
+        assert_eq!(result.unwrap(), "<h1>Hello, WebUI!</h1>");
     }
 
     #[test]
@@ -365,10 +352,10 @@ mod tests {
         );
 
         let result_true = build_and_render_inner(&files, r#"{"show": true}"#, "index.html", "/");
-        assert_eq!(result_true.as_deref(), Ok("Visible"));
+        assert_eq!(result_true.unwrap(), "Visible");
 
         let result_false = build_and_render_inner(&files, r#"{"show": false}"#, "index.html", "/");
-        assert_eq!(result_false.as_deref(), Ok(""));
+        assert_eq!(result_false.unwrap(), "");
     }
 
     #[test]
@@ -443,6 +430,6 @@ mod tests {
         );
 
         let result = build_and_render_inner(&files, "{}", "index.html", "/");
-        assert_eq!(result.as_deref(), Ok("<h1>Static</h1><p>Content</p>"));
+        assert_eq!(result.unwrap(), "<h1>Static</h1><p>Content</p>");
     }
 }
