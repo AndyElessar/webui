@@ -15,44 +15,11 @@
 /**
  * Map of camelCase property names to their HTML attribute names.
  *
- * Covers two categories of irregular mappings:
- *
- * 1. Multi-word ARIA attributes — concatenated lowercase after `aria-`
- *    (e.g., `ariaDescribedBy` → `aria-describedby`), per the ARIAMixin spec.
- * 2. HTML global/element attributes — concatenated lowercase attribute names
- *    with camelCase property counterparts (e.g., `readOnly` → `readonly`).
+ * ARIA attributes (`ariaXxxYyy → aria-` + lowercase remainder) are handled
+ * algorithmically in `toKebabCase`. Only HTML global/element attributes
+ * with irregular mappings (concatenated lowercase) need explicit entries.
  */
 const propertyToAttribute: Record<string, string> = Object.assign(Object.create(null) as Record<string, string>, {
-  // --- ARIA (ARIAMixin) ---
-  ariaActiveDescendant: 'aria-activedescendant',
-  ariaAutoComplete: 'aria-autocomplete',
-  ariaBrailleLabel: 'aria-braillelabel',
-  ariaBrailleRoleDescription: 'aria-brailleroledescription',
-  ariaColCount: 'aria-colcount',
-  ariaColIndex: 'aria-colindex',
-  ariaColIndexText: 'aria-colindextext',
-  ariaColSpan: 'aria-colspan',
-  ariaDescribedBy: 'aria-describedby',
-  ariaDropEffect: 'aria-dropeffect',
-  ariaErrorMessage: 'aria-errormessage',
-  ariaFlowTo: 'aria-flowto',
-  ariaHasPopup: 'aria-haspopup',
-  ariaKeyShortcuts: 'aria-keyshortcuts',
-  ariaLabelledBy: 'aria-labelledby',
-  ariaMultiLine: 'aria-multiline',
-  ariaMultiSelectable: 'aria-multiselectable',
-  ariaPosInSet: 'aria-posinset',
-  ariaReadOnly: 'aria-readonly',
-  ariaRoleDescription: 'aria-roledescription',
-  ariaRowCount: 'aria-rowcount',
-  ariaRowIndex: 'aria-rowindex',
-  ariaRowIndexText: 'aria-rowindextext',
-  ariaRowSpan: 'aria-rowspan',
-  ariaSetSize: 'aria-setsize',
-  ariaValueMax: 'aria-valuemax',
-  ariaValueMin: 'aria-valuemin',
-  ariaValueNow: 'aria-valuenow',
-  ariaValueText: 'aria-valuetext',
   // --- HTML global/element attributes ---
   accessKey: 'accesskey',
   autoCapitalize: 'autocapitalize',
@@ -77,10 +44,48 @@ const propertyToAttribute: Record<string, string> = Object.assign(Object.create(
   useMap: 'usemap',
 });
 
-/** Convert camelCase to kebab-case for attribute reflection. */
+/**
+ * Convert a camelCase DOM property name into its kebab-case HTML attribute form.
+ *
+ * This function is optimized for framework-level hot paths where attribute
+ * normalization may run thousands of times per render. It performs three
+ * progressively cheaper checks:
+ *
+ * 1. **Direct lookup for irregular mappings**  
+ *    Many DOM properties (e.g., `readOnly`, `tabIndex`, `crossOrigin`) do not
+ *    follow simple camelCase → kebab-case rules. These are resolved through a
+ *    precomputed `propertyToAttribute` map for O(1) returns with no string
+ *    processing.
+ *
+ * 2. **Fast path for ARIA attributes**  
+ *    ARIA properties always begin with `aria` followed by an uppercase letter
+ *    (e.g., `ariaDescribedBy`). These map to `aria-` + the lowercase remainder.
+ *    This branch avoids the general loop and uses the engine-optimized
+ *    `.toLowerCase()` for the suffix.
+ *
+ * 3. **General camelCase → kebab-case conversion**  
+ *    For all other inputs, the function performs a tight ASCII-only scan:
+ *    uppercase A–Z (65–90) are converted to lowercase and prefixed with `-`,
+ *    while all other characters are copied as-is. This avoids regex engines,
+ *    callback allocations, and match objects, producing predictable,
+ *    allocation-minimal performance ideal for DOM attribute reflection.
+ *
+ * The result is a predictable, JIT-friendly transformation suitable for
+ * attribute diffing, SSR serialization, and runtime DOM patching.
+ */
 export function toKebabCase(str: string): string {
   const mapped = propertyToAttribute[str];
-  return mapped ?? str.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
+  if (mapped) return mapped;
+  // ARIA properties: ariaXxxYyy → aria- + lowercase remainder
+  if (str.length > 4 && str.charCodeAt(0) === 97 /* a */ && str.startsWith('aria') && str.charCodeAt(4) >= 65 && str.charCodeAt(4) <= 90) {
+    return 'aria-' + str.slice(4).toLowerCase();
+  }
+  let out = '';
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    out += code >= 65 && code <= 90 ? '-' + String.fromCharCode(code + 32) : str[i];
+  }
+  return out;
 }
 
 /**
