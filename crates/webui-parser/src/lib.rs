@@ -1420,19 +1420,61 @@ impl HtmlParser {
             exact,
             query,
             keep_alive: self.has_element_attribute(node, "keep-alive", source)?,
+            cache_tags: self
+                .get_element_attribute(node, "cache-tags", source)?
+                .map(|v| route_parser::parse_tag_list(&v))
+                .unwrap_or_default(),
+            invalidates: self
+                .get_element_attribute(node, "invalidates", source)?
+                .map(|v| route_parser::parse_tag_list(&v))
+                .unwrap_or_default(),
+            pending_component: self
+                .get_element_attribute(node, "pending", source)?
+                .unwrap_or_default(),
+            error_component: self
+                .get_element_attribute(node, "error", source)?
+                .unwrap_or_default(),
         };
 
         // Validate attributes (component is required)
         route_parser::validate_attributes(&attrs)?;
 
-        // Extract params from path template (validation only)
-        route_parser::extract_params(&path)?;
+        // Extract params from path template and validate
+        let route_params: std::collections::HashSet<String> =
+            route_parser::extract_params(&path)?.into_iter().collect();
+        if !attrs.cache_tags.is_empty() {
+            route_parser::validate_tag_placeholders(
+                &attrs.cache_tags,
+                &route_params,
+                "cache-tags",
+                &path,
+            )?;
+        }
+        if !attrs.invalidates.is_empty() {
+            route_parser::validate_tag_placeholders(
+                &attrs.invalidates,
+                &route_params,
+                "invalidates",
+                &path,
+            )?;
+        }
+
+        // Validate pending component exists in the registry
+        if !attrs.pending_component.is_empty() {
+            self.ensure_route_component_parsed(&attrs.pending_component)?;
+        }
+        // Validate error component exists in the registry
+        if !attrs.error_component.is_empty() {
+            self.ensure_route_component_parsed(&attrs.error_component)?;
+        }
 
         // Ensure the component's template is parsed and registered
         self.ensure_route_component_parsed(&component)?;
 
-        // Recursively parse nested <route> children
-        let children = self.parse_child_routes(node, source)?;
+        // Recursively parse nested <route> children, passing accumulated params
+        let mut all_params = std::collections::HashSet::new();
+        all_params.extend(route_params);
+        let children = self.parse_child_routes(node, source, &all_params)?;
 
         // Flush any pending raw content before the route fragment
         self.flush_raw_buffer(fragments);
@@ -1448,7 +1490,12 @@ impl HtmlParser {
     }
 
     /// Parse nested `<route>` children of a route element.
-    fn parse_child_routes(&mut self, node: Node, source: &str) -> Result<Vec<WebUiFragmentRoute>> {
+    fn parse_child_routes(
+        &mut self,
+        node: Node,
+        source: &str,
+        ancestor_params: &std::collections::HashSet<String>,
+    ) -> Result<Vec<WebUiFragmentRoute>> {
         let mut children = Vec::new();
         let mut cursor = node.walk();
 
@@ -1456,7 +1503,8 @@ impl HtmlParser {
             if child.kind() == "element" {
                 if let Ok(tag) = self.get_element_tag_name(child, source) {
                     if tag == "route" {
-                        let child_route = self.parse_route_as_fragment(child, source)?;
+                        let child_route =
+                            self.parse_route_as_fragment(child, source, ancestor_params)?;
                         children.push(child_route);
                     }
                 }
@@ -1467,7 +1515,12 @@ impl HtmlParser {
     }
 
     /// Parse a `<route>` element into a `WebUiFragmentRoute` (for nesting).
-    fn parse_route_as_fragment(&mut self, node: Node, source: &str) -> Result<WebUiFragmentRoute> {
+    fn parse_route_as_fragment(
+        &mut self,
+        node: Node,
+        source: &str,
+        ancestor_params: &std::collections::HashSet<String>,
+    ) -> Result<WebUiFragmentRoute> {
         let path = self
             .get_element_attribute(node, "path", source)?
             .unwrap_or_default();
@@ -1486,16 +1539,60 @@ impl HtmlParser {
             exact,
             query,
             keep_alive: self.has_element_attribute(node, "keep-alive", source)?,
+            cache_tags: self
+                .get_element_attribute(node, "cache-tags", source)?
+                .map(|v| route_parser::parse_tag_list(&v))
+                .unwrap_or_default(),
+            invalidates: self
+                .get_element_attribute(node, "invalidates", source)?
+                .map(|v| route_parser::parse_tag_list(&v))
+                .unwrap_or_default(),
+            pending_component: self
+                .get_element_attribute(node, "pending", source)?
+                .unwrap_or_default(),
+            error_component: self
+                .get_element_attribute(node, "error", source)?
+                .unwrap_or_default(),
         };
 
         route_parser::validate_attributes(&attrs)?;
-        route_parser::extract_params(&path)?;
+
+        // Extract params from path template and validate placeholders
+        // against both this route's own params AND ancestor params
+        let own_params: std::collections::HashSet<String> =
+            route_parser::extract_params(&path)?.into_iter().collect();
+        let mut all_params = ancestor_params.clone();
+        all_params.extend(own_params.iter().cloned());
+        if !attrs.cache_tags.is_empty() {
+            route_parser::validate_tag_placeholders(
+                &attrs.cache_tags,
+                &all_params,
+                "cache-tags",
+                &path,
+            )?;
+        }
+        if !attrs.invalidates.is_empty() {
+            route_parser::validate_tag_placeholders(
+                &attrs.invalidates,
+                &all_params,
+                "invalidates",
+                &path,
+            )?;
+        }
+
+        // Validate pending/error components exist
+        if !attrs.pending_component.is_empty() {
+            self.ensure_route_component_parsed(&attrs.pending_component)?;
+        }
+        if !attrs.error_component.is_empty() {
+            self.ensure_route_component_parsed(&attrs.error_component)?;
+        }
 
         // Ensure the component's template is parsed
         self.ensure_route_component_parsed(&component)?;
 
-        // Recursively parse nested children
-        let children = self.parse_child_routes(node, source)?;
+        // Recursively parse nested children, passing accumulated params
+        let children = self.parse_child_routes(node, source, &all_params)?;
 
         Ok(route_parser::build_route_fragment(
             &attrs, component, children,
