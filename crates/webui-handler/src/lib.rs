@@ -13,6 +13,7 @@ pub mod route_matcher;
 pub(crate) mod route_renderer;
 
 use plugin::HandlerPlugin;
+use route_matcher::CompiledRouteCache;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -111,8 +112,6 @@ pub struct WebUIHandler {
 struct WebUIProcessContext<'a> {
     protocol: &'a WebUIProtocol,
     state: &'a Value,
-    #[allow(dead_code)]
-    depth: usize,
     writer: &'a mut dyn ResponseWriter,
     local_vars: HashMap<String, Value>,
     /// Accumulates component attribute values between attrStart and the component fragment.
@@ -135,6 +134,12 @@ struct WebUIProcessContext<'a> {
     entry_id: String,
     /// CSP nonce for inline `<script>` tags (None = no nonce attribute).
     nonce: Option<String>,
+    /// Per-render compiled route cache (avoids re-parsing route patterns within a single render).
+    route_cache: CompiledRouteCache,
+    /// Counter for `data-ri` attributes on matched route elements.
+    /// Incremented each time a matched route is rendered, allowing O(1) element
+    /// binding on the client side instead of DOM-walking.
+    route_chain_index: usize,
 }
 
 /// Get the component attribute name, stripping `:` prefix and converting to camelCase.
@@ -145,6 +150,29 @@ struct WebUIProcessContext<'a> {
 fn component_attr_name(name: &str) -> String {
     let stripped = name.strip_prefix(':').unwrap_or(name);
     webui_protocol::attrs::attribute_to_camel(stripped)
+}
+
+/// Write a usize as decimal digits directly to the writer, avoiding `format!` allocation.
+fn write_usize(writer: &mut dyn ResponseWriter, mut n: usize) -> Result<()> {
+    if n == 0 {
+        return writer.write("0");
+    }
+    // Max digits for a 64-bit usize is 20.
+    let mut buf = [0u8; 20];
+    let mut pos = buf.len();
+    while n > 0 {
+        pos -= 1;
+        // n % 10 is always in 0..=9, fits in u8 without truncation.
+        #[allow(clippy::cast_possible_truncation)]
+        let digit = (n % 10) as u8;
+        buf[pos] = b'0' + digit;
+        n /= 10;
+    }
+    // Digits are always valid ASCII/UTF-8.
+    match std::str::from_utf8(&buf[pos..]) {
+        Ok(s) => writer.write(s),
+        Err(_) => writer.write("0"),
+    }
 }
 
 impl WebUIHandler {
@@ -183,7 +211,6 @@ impl WebUIHandler {
         let mut context = WebUIProcessContext {
             protocol,
             state,
-            depth: 0,
             writer,
             local_vars: HashMap::new(),
             component_attrs: HashMap::new(),
@@ -194,6 +221,8 @@ impl WebUIHandler {
             route_children: Vec::new(),
             entry_id: options.entry_id.to_string(),
             nonce: options.nonce.map(String::from),
+            route_cache: CompiledRouteCache::new(),
+            route_chain_index: 0,
         };
         self.process_fragment_id(options.entry_id, &mut context)?;
 
@@ -220,7 +249,6 @@ impl WebUIHandler {
         let mut context = WebUIProcessContext {
             protocol,
             state,
-            depth: 0,
             writer,
             local_vars: HashMap::new(),
             component_attrs: HashMap::new(),
@@ -231,6 +259,8 @@ impl WebUIHandler {
             route_children: Vec::new(),
             entry_id: entry_id.to_string(),
             nonce: None,
+            route_cache: CompiledRouteCache::new(),
+            route_chain_index: 0,
         };
 
         if let Some(p) = &mut context.plugin {
@@ -280,6 +310,7 @@ impl WebUIHandler {
             fragments,
             &context.request_path,
             &context.route_base,
+            &mut context.route_cache,
         );
 
         for item in fragments {
@@ -331,12 +362,16 @@ impl WebUIHandler {
         }
 
         // Find the best matching child route
+        let request_segments = route_matcher::split_request_path(&context.request_path);
         let mut best: Option<(usize, route_matcher::RouteMatch)> = None;
         for (idx, child) in children.iter().enumerate() {
             let resolved = route_matcher::resolve_route_path(&child.path, &context.route_base);
-            if let Some(m) =
-                route_matcher::match_single_route(&resolved, &context.request_path, child.exact)
-            {
+            if let Some(m) = route_matcher::match_route_cached_with_segments(
+                &mut context.route_cache,
+                &resolved,
+                &request_segments,
+                child.exact,
+            ) {
                 let is_better = best
                     .as_ref()
                     .is_none_or(|(_, prev)| m.specificity > prev.specificity);
@@ -385,16 +420,13 @@ impl WebUIHandler {
                 if matched_child.exact {
                     context.writer.write(" exact")?;
                 }
-                if !matched_child.allowed_query.is_empty() {
-                    context.writer.write(" query=\"")?;
-                    context.writer.write(&matched_child.allowed_query)?;
-                    context.writer.write("\"")?;
-                }
-                if matched_child.keep_alive {
-                    context.writer.write(" keep-alive")?;
-                }
-                route_renderer::write_route_cache_attrs(context.writer, matched_child)?;
-                context.writer.write(" active>")?;
+                route_renderer::write_route_pending_attrs(context.writer, matched_child)?;
+                // Emit data-ri for O(1) client-side element binding
+                let ri = context.route_chain_index;
+                context.route_chain_index += 1;
+                context.writer.write(" data-ri=\"")?;
+                write_usize(context.writer, ri)?;
+                context.writer.write("\" active>")?;
 
                 context.writer.write("<")?;
                 context.writer.write(comp)?;
@@ -436,15 +468,7 @@ impl WebUIHandler {
                 if child.exact {
                     context.writer.write(" exact")?;
                 }
-                if !child.allowed_query.is_empty() {
-                    context.writer.write(" query=\"")?;
-                    context.writer.write(&child.allowed_query)?;
-                    context.writer.write("\"")?;
-                }
-                if child.keep_alive {
-                    context.writer.write(" keep-alive")?;
-                }
-                route_renderer::write_route_cache_attrs(context.writer, child)?;
+                route_renderer::write_route_pending_attrs(context.writer, child)?;
                 context
                     .writer
                     .write(" style=\"display:none\"></webui-route>")?;
@@ -513,18 +537,15 @@ impl WebUIHandler {
         if route_frag.exact {
             context.writer.write(" exact")?;
         }
-        if !route_frag.allowed_query.is_empty() {
-            context.writer.write(" query=\"")?;
-            context.writer.write(&route_frag.allowed_query)?;
-            context.writer.write("\"")?;
-        }
-        if route_frag.keep_alive {
-            context.writer.write(" keep-alive")?;
-        }
-        route_renderer::write_route_cache_attrs(context.writer, route_frag)?;
+        route_renderer::write_route_pending_attrs(context.writer, route_frag)?;
 
         if is_matched {
-            context.writer.write(" active>")?;
+            // Emit data-ri for O(1) client-side element binding
+            let ri = context.route_chain_index;
+            context.route_chain_index += 1;
+            context.writer.write(" data-ri=\"")?;
+            write_usize(context.writer, ri)?;
+            context.writer.write("\" active>")?;
 
             if !route_frag.fragment_id.is_empty() {
                 let saved_route_base = context.route_base.clone();
@@ -757,13 +778,15 @@ impl WebUIHandler {
             let is_shadow = context.protocol.dom_strategy() == webui_protocol::DomStrategy::Shadow;
 
             if is_link {
+                let comp_index = crate::route_handler::build_component_index(context.protocol);
                 let (needed_components, _) =
                     crate::route_handler::get_needed_components_for_request(
                         context.protocol,
                         &context.entry_id,
                         &context.request_path,
                         "",
-                    );
+                        &comp_index,
+                    )?;
 
                 for name in &needed_components {
                     if let Some(href) = context
@@ -794,20 +817,12 @@ impl WebUIHandler {
             // Build the component → index map for the inventory bitfield.
             let comp_index = crate::route_handler::build_component_index(context.protocol);
 
-            // Emit inventory meta tag based on actually rendered components.
-            // Placed here (not head_end) because rendered_components is only
-            // complete after the full SSR pass. The router reads it via
-            // document.querySelector regardless of position.
+            // Compute the inventory hex from actually rendered components.
             let (_, inventory_hex) = crate::route_handler::filter_needed_components(
                 &context.rendered_components,
                 "",
                 &comp_index,
-            );
-            context
-                .writer
-                .write("<meta name=\"webui-inventory\" content=\"")?;
-            context.writer.write(&inventory_hex)?;
-            context.writer.write("\">")?;
+            )?;
 
             // Emit templates for all REACHABLE components on the current route,
             // not just those rendered in this SSR pass. Components inside false
@@ -821,7 +836,8 @@ impl WebUIHandler {
                 &context.entry_id,
                 &context.request_path,
                 "",
-            );
+                &comp_index,
+            )?;
             let reachable: std::collections::HashSet<String> =
                 reachable_names.into_iter().collect();
 
@@ -850,29 +866,138 @@ impl WebUIHandler {
                 }
             }
 
-            if let Some(ref p) = context.plugin {
-                p.emit_templates(
-                    context.protocol,
-                    &reachable,
-                    context.nonce.as_deref(),
-                    context.writer,
-                )?;
+            // Try to collect template JS sources for merging into the
+            // consolidated script block. If the plugin returns None
+            // (non-JS templates, e.g. FAST), fall back to separate emission.
+            let template_js = context
+                .plugin
+                .as_ref()
+                .and_then(|p| p.collect_template_js(context.protocol, &reachable));
+
+            if template_js.is_none() {
+                // Non-JS templates (FAST plugin) — emit separately
+                if let Some(ref p) = context.plugin {
+                    p.emit_templates(
+                        context.protocol,
+                        &reachable,
+                        context.nonce.as_deref(),
+                        context.writer,
+                    )?;
+                }
             }
 
-            // Emit initial state as JSON for client-side hydration.
-            // Like Preact/Next.js, we pass the same state used for SSR
-            // so the client doesn't need to reconstruct it from the DOM.
+            // ── Consolidated SSR script block ──────────────────────────
+            //
+            // Merges all SSR metadata into a single <script> tag:
+            //   1. Bootstrap meta  (window.__webui: chain, inventory, nonce, css, styles, state, templates)
+            //   2. Template IIFEs  (write into window.__webui.templates)
+            //
+            // Single-script reduces HTML parse overhead and ensures all
+            // SSR metadata is available atomically before DOMContentLoaded.
+
+            // Build the window.__webui bootstrap object
+            let mut webui_obj = serde_json::Map::new();
+
+            // Templates — empty object so IIFE scripts can write into it
+            webui_obj.insert(
+                "templates".into(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+
+            // State — emitted as window.__webui.state
+            webui_obj.insert("state".into(), context.state.clone());
+
+            // Chain
+            let chain = crate::route_handler::collect_route_chain(
+                context.protocol,
+                &context.entry_id,
+                &context.request_path,
+                &mut context.route_cache,
+            );
+            if !chain.is_empty() {
+                let chain_json = serde_json::Value::Array(
+                    chain
+                        .iter()
+                        .map(crate::route_handler::RouteChainEntry::to_json)
+                        .collect(),
+                );
+                webui_obj.insert("chain".into(), chain_json);
+            }
+
+            // Inventory
+            webui_obj.insert("inventory".into(), serde_json::Value::String(inventory_hex));
+
+            // Nonce
+            if let Some(ref nonce) = context.nonce {
+                webui_obj.insert("nonce".into(), serde_json::Value::String(nonce.clone()));
+            }
+
+            // CSS hrefs emitted during SSR (Link-strategy components)
+            let is_link = context.protocol.css_strategy() == webui_protocol::CssStrategy::Link;
+            if is_link {
+                let mut css_hrefs: Vec<serde_json::Value> = Vec::new();
+                for name in &reachable {
+                    if let Some(href) = context
+                        .protocol
+                        .components
+                        .get(name)
+                        .map(|c| c.css_href.as_str())
+                        .filter(|h| !h.is_empty())
+                    {
+                        css_hrefs.push(serde_json::Value::String(href.to_string()));
+                    }
+                }
+                if !css_hrefs.is_empty() {
+                    webui_obj.insert("css".into(), serde_json::Value::Array(css_hrefs));
+                }
+            }
+
+            // Module style specifiers emitted during SSR
+            {
+                let mut style_specs: Vec<serde_json::Value> = Vec::new();
+                for name in &reachable {
+                    if context
+                        .protocol
+                        .components
+                        .get(name)
+                        .map(|c| !c.css.is_empty())
+                        .unwrap_or(false)
+                    {
+                        style_specs.push(serde_json::Value::String(name.clone()));
+                    }
+                }
+                if !style_specs.is_empty() {
+                    webui_obj.insert("styles".into(), serde_json::Value::Array(style_specs));
+                }
+            }
+
+            // Open the consolidated <script> tag
             if let Some(ref nonce) = context.nonce {
                 context.writer.write("<script nonce=\"")?;
                 context.writer.write(nonce)?;
-                context.writer.write("\">window.__webui_state=")?;
+                context.writer.write("\">")?;
             } else {
-                context.writer.write("<script>window.__webui_state=")?;
+                context.writer.write("<script>")?;
             }
-            let state_json = serde_json::to_string(context.state).unwrap_or_default();
-            // Escape </script> inside JSON to prevent premature tag closure
-            let safe_json = state_json.replace("</", "<\\/");
-            context.writer.write(&safe_json)?;
+
+            // 1. Emit window.__webui bootstrap object (chain, inventory,
+            //    nonce, css, styles, state — all in one JSON assignment)
+            context.writer.write("window.__webui=")?;
+            let webui_str =
+                serde_json::to_string(&serde_json::Value::Object(webui_obj)).unwrap_or_default();
+            let safe_webui = webui_str.replace("</", "<\\/");
+            context.writer.write(&safe_webui)?;
+            context.writer.write(";")?;
+
+            // 2. Template IIFEs — write into window.__webui.templates
+            //    (parser-generated IIFEs reference this object directly)
+            if let Some(ref tmpls) = template_js {
+                context.writer.write("\n")?;
+                for tmpl in tmpls {
+                    context.writer.write(tmpl)?;
+                }
+            }
+
             context.writer.write("</script>\n")?;
         }
 
@@ -1093,7 +1218,6 @@ impl WebUIHandler {
         let mut context = WebUIProcessContext {
             protocol,
             state,
-            depth: 0,
             writer,
             local_vars: HashMap::new(),
             component_attrs: HashMap::new(),
@@ -1104,6 +1228,8 @@ impl WebUIHandler {
             route_children: Vec::new(),
             entry_id: options.entry_id.to_string(),
             nonce: options.nonce.map(String::from),
+            route_cache: CompiledRouteCache::new(),
+            route_chain_index: 0,
         };
 
         self.process_fragment_id(options.entry_id, &mut context)?;
@@ -5757,7 +5883,9 @@ mod tests {
             "section active: {html}"
         );
         assert!(
-            html.contains("component=\"topic-comp\"") && html.contains("exact active>"),
+            html.contains("component=\"topic-comp\"")
+                && html.contains("exact")
+                && html.contains("active>"),
             "topic active: {html}"
         );
         assert!(
@@ -6445,7 +6573,7 @@ mod tests {
         for name in ["app-shell", "cart-panel", "product-card"] {
             let comp = protocol.components.entry(name.to_string()).or_default();
             comp.template = format!(
-                "(function(){{var w=window.__webui_templates||(window.__webui_templates={{}});w['{name}']={{h:'<div/>'}};}})();\n"
+                "(function(){{var w=(window.__webui||(window.__webui={{}})).templates||(window.__webui.templates={{}});w['{name}']={{h:'<div/>'}};}})();\n"
             );
             comp.css = format!(".{name}{{display:block}}");
         }
@@ -6596,7 +6724,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matched_route_emits_query_attr() {
+    fn test_matched_route_omits_query_attr_from_dom() {
         let protocol = make_query_route_protocol();
         let state = test_json!({});
         let handler = WebUIHandler::new();
@@ -6612,14 +6740,15 @@ mod tests {
             .expect("render failed");
 
         let html = writer.get_content();
+        // query attr is no longer in DOM — it's in the SSR chain JSON instead
         assert!(
-            html.contains(r#"query="action,to,subject""#),
-            "matched route with allowed_query should emit query attr: {html}"
+            !html.contains(r#"query="action,to,subject""#),
+            "query attr should not be in DOM output (moved to SSR chain JSON): {html}"
         );
     }
 
     #[test]
-    fn test_nonmatched_route_preserves_query_attr() {
+    fn test_nonmatched_route_omits_query_attr_from_dom() {
         let protocol = make_query_route_protocol();
         let state = test_json!({});
         let handler = WebUIHandler::new();
@@ -6635,10 +6764,10 @@ mod tests {
             .expect("render failed");
 
         let html = writer.get_content();
-        // Compose is the non-matched sibling — it should still have query attr
+        // query attr should not be on hidden siblings either
         assert!(
-            html.contains(r#"query="action,to,subject""#),
-            "hidden route should preserve query attr: {html}"
+            !html.contains(r#"query="#),
+            "hidden route should not have query attr: {html}"
         );
     }
 
