@@ -654,12 +654,12 @@ impl Catalog {
                 category: primary_collection.to_string(),
                 gradient,
                 gradient_alt,
-                image_url: format!("/_image/{}", def.image_url),
-                image_alt_url: format!("/_image/{}", image_alt_url),
+                image_url: format!("_image/{}", def.image_url),
+                image_alt_url: format!("_image/{}", image_alt_url),
                 gallery_image_urls: def
                     .gallery_image_urls
                     .iter()
-                    .map(|url| format!("/_image/{}", url))
+                    .map(|url| format!("_image/{}", url))
                     .collect(),
                 available: true,
                 tags,

@@ -52,7 +52,7 @@ async fn handle_frontend_request(
     let stable_path = cart::without_cart(context.request_path());
     let cart_state = build_cart_state(&context.cart_read().cart, data.catalog(), &stable_path);
     let is_partial = context.wants_json();
-    let (page_state, image_preloads) = state::build_route_state(&state::RouteStateRequest {
+    let (mut page_state, image_preloads) = state::build_route_state(&state::RouteStateRequest {
         catalog: data.catalog(),
         route_path: context.route_path(),
         params: &route_params,
@@ -61,6 +61,14 @@ async fn handle_frontend_request(
         is_partial,
     })
     .ok_or(ServerError::NotFound)?;
+
+    // Inject basePath into state for <base href="{{basePath}}">.
+    if let Value::Object(ref mut map) = page_state {
+        map.insert(
+            "basePath".into(),
+            Value::String(data.base_path().to_string()),
+        );
+    }
 
     if context.wants_json() {
         return Ok(partial_response(&context, data.get_ref(), &page_state));
@@ -219,7 +227,7 @@ fn build_head_preload_tags(image_urls: &[String]) -> String {
     let capacity = 80 + image_urls.len() * 120;
     let mut buf = String::with_capacity(capacity);
 
-    buf.push_str(r#"<link rel="modulepreload" href="/index.js" data-webui-ssr-preload="script">"#);
+    buf.push_str(r#"<link rel="modulepreload" href="index.js" data-webui-ssr-preload="script">"#);
 
     for (i, url) in image_urls.iter().enumerate() {
         buf.push_str(r#"<link rel="preload" as="image" href=""#);
@@ -318,7 +326,7 @@ mod tests {
             html.contains(r#"data-webui-ssr-preload="style""#),
             "Framework should emit CSS preload with data-webui-ssr-preload: {html}"
         );
-        assert!(html.contains(r#"href="/_image/t-shirt-1?w=640&q=75""#));
+        assert!(html.contains(r#"href="_image/t-shirt-1?w=640&q=75""#));
         assert!(
             !html.contains(r#"\"data-webui-ssr-preload\""#),
             "server-only preload tags should not leak into serialized client state"

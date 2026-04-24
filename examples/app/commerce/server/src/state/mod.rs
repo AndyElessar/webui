@@ -165,7 +165,7 @@ mod tests {
             "home page should preload only the primary hero image"
         );
         assert!(
-            image_preloads[0].contains("/_image/"),
+            image_preloads[0].contains("_image/"),
             "image preloads should reference image proxy"
         );
         assert_eq!(
@@ -233,7 +233,7 @@ mod tests {
             1,
             "product page should preload hero image"
         );
-        assert!(image_preloads[0].contains("/_image/"));
+        assert!(image_preloads[0].contains("_image/"));
     }
 
     #[test]
