@@ -1,0 +1,44 @@
+[package]
+name = "microsoft-webui-press"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "High-performance Static Site Generator powered by WebUI Framework"
+default-run = "webui-press"
+readme = "README.md"
+
+[lib]
+name = "webui_docs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "webui-press"
+path = "src/main.rs"
+
+[dependencies]
+microsoft-webui = { path = "../webui", version = "0.0.10", features = ["cli"] }
+microsoft-webui-handler = { path = "../webui-handler", version = "0.0.10" }
+microsoft-webui-protocol = { path = "../webui-protocol", version = "0.0.10" }
+
+# Markdown + syntax highlighting
+comrak = { workspace = true }
+syntect = { workspace = true }
+
+# Config + frontmatter
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+console = { workspace = true }
+anyhow = { workspace = true }
+
+# Performance
+rayon = { workspace = true }
+
+# Utilities
+thiserror = { workspace = true }

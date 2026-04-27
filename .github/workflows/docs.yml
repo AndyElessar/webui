@@ -8,10 +8,13 @@ on:
     branches: [ "main" ]
     paths:
       - 'docs/**'
-      - 'crates/webui-wasm/**'
+      - 'packages/webui-press/**'
       - 'crates/webui-parser/**'
       - 'crates/webui-handler/**'
       - 'crates/webui-protocol/**'
+      - 'crates/webui-node/**'
+      - 'crates/webui-press/**'
+      - 'packages/webui/**'
   workflow_dispatch:
 
 jobs:
@@ -19,31 +22,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build
 
-      - name: Build WASM playground
-        uses: ./.github/actions/setup-wasm
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '22'
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: latest
-          run_install: false
-
-      - name: Install Dependencies
-        run: cd docs && pnpm install
-
-      - name: Build Site
-        run: cd docs && pnpm build
+      - name: Build docs
+        run: pnpm --filter @webui/docs... build
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: docs/.vitepress/dist
+          publish_dir: docs/dist
