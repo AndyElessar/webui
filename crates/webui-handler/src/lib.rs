@@ -875,7 +875,7 @@ impl WebUIHandler {
                 .and_then(|p| p.collect_template_js(context.protocol, &reachable));
 
             if template_js.is_none() {
-                // Non-JS templates (FAST plugin) — emit separately
+                // Non-JS templates (FAST plugins) - emit separately
                 if let Some(ref p) = context.plugin {
                     p.emit_templates(
                         context.protocol,
@@ -1141,8 +1141,8 @@ impl WebUIHandler {
             } else {
                 // Dynamic attribute — resolve and render
                 let value = self.resolve_value(&attr.value, context);
-                // Always emit the attribute so FAST hydration binding
-                // markers (data-fe-b-N) match the DOM node structure.
+                // Always emit the attribute so FAST hydration markers
+                // (`data-fe`) match the DOM node structure.
                 match &value {
                     Some(Value::String(s)) => {
                         write_attr(
@@ -4313,7 +4313,7 @@ mod tests {
 
     // ── GROUP 9: Hydration (SKIP) ─────────────────────────────────────
 
-    // TODO: test_hydration – requires FastHydrationPlugin integration; see plugin/fast.rs
+    // TODO: test_hydration - requires FAST handler plugin integration; see plugin/fast.rs
 
     // ── Component tests ──────────────────────────────────────────────
 
