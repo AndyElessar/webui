@@ -30,6 +30,30 @@ public class WebUIHandlerTests
     }
 
     [Fact]
+    public void Handler_SetNonce_DoesNotThrow()
+    {
+        using var handler = new WebUIHandler();
+        handler.SetNonce("nonce-value");
+    }
+
+    [Fact]
+    public void Handler_ClearNonce_DoesNotThrow()
+    {
+        using var handler = new WebUIHandler();
+        handler.SetNonce(null);
+    }
+
+    [Fact]
+    public void Handler_RequestScopedNonceUsage_AllowsSeparateHandlers()
+    {
+        using var firstRequestHandler = new WebUIHandler();
+        firstRequestHandler.SetNonce("first-request-nonce");
+
+        using var secondRequestHandler = new WebUIHandler();
+        secondRequestHandler.SetNonce("second-request-nonce");
+    }
+
+    [Fact]
     public void Handler_RenderAfterDispose_ThrowsObjectDisposedException()
     {
         var handler = new WebUIHandler();
@@ -37,5 +61,14 @@ public class WebUIHandlerTests
 
         Assert.Throws<ObjectDisposedException>(() =>
             handler.Render(Array.Empty<byte>(), "{}", "index.html", "/"));
+    }
+
+    [Fact]
+    public void Handler_SetNonceAfterDispose_ThrowsObjectDisposedException()
+    {
+        var handler = new WebUIHandler();
+        handler.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => handler.SetNonce("nonce-value"));
     }
 }

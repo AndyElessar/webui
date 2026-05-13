@@ -66,6 +66,76 @@ pub fn run_command_quiet(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result
     }
 }
 
+/// Run a command with captured output and additional environment variables.
+pub fn run_command_quiet_with_env(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    use std::process::Stdio;
+
+    let mut command = build_command(cmd, args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    match command.output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let mut msg = String::new();
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                msg.push_str(&s);
+            }
+            if let Ok(s) = String::from_utf8(output.stderr) {
+                msg.push_str(&s);
+            }
+            if msg.is_empty() {
+                msg = format!("exit code {}", output.status.code().unwrap_or(1));
+            }
+            Err(msg)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Create a writable local environment for dotnet and NuGet commands.
+pub fn prepare_dotnet_env(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let base = root.join("target").join("dotnet-env");
+    let cli_home = base.join("cli-home");
+    let nuget_packages = base.join("nuget-packages");
+    let tmp_dir = base.join("tmp");
+
+    for dir in [&cli_home, &nuget_packages, &tmp_dir] {
+        fs::create_dir_all(dir)
+            .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+    }
+
+    Ok(vec![
+        (
+            "DOTNET_SKIP_FIRST_TIME_EXPERIENCE".to_string(),
+            "1".to_string(),
+        ),
+        ("DOTNET_CLI_TELEMETRY_OPTOUT".to_string(), "1".to_string()),
+        ("DOTNET_NOLOGO".to_string(), "1".to_string()),
+        (
+            "DOTNET_CLI_HOME".to_string(),
+            cli_home.to_string_lossy().into_owned(),
+        ),
+        (
+            "NUGET_PACKAGES".to_string(),
+            nuget_packages.to_string_lossy().into_owned(),
+        ),
+        ("TMPDIR".to_string(), tmp_dir.to_string_lossy().into_owned()),
+        ("TMP".to_string(), tmp_dir.to_string_lossy().into_owned()),
+        ("TEMP".to_string(), tmp_dir.to_string_lossy().into_owned()),
+    ])
+}
+
 /// Build a [`Command`] for `cmd` with `args`, resolving `.cmd`/`.bat` scripts
 /// on Windows.
 ///
@@ -212,7 +282,7 @@ pub fn ensure_rustup_target(target: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::workspace_root;
+    use super::{prepare_dotnet_env, workspace_root};
 
     #[test]
     fn workspace_root_has_workspace_cargo_toml() {
@@ -226,5 +296,22 @@ mod tests {
             "workspace root should contain Cargo.toml at {}",
             root.display()
         );
+    }
+
+    #[test]
+    fn prepare_dotnet_env_creates_local_directories() {
+        let dir = match tempfile::TempDir::new() {
+            Ok(dir) => dir,
+            Err(error) => panic!("{error}"),
+        };
+        let envs = match prepare_dotnet_env(dir.path()) {
+            Ok(envs) => envs,
+            Err(message) => panic!("{message}"),
+        };
+
+        assert!(envs.iter().any(|(key, _)| key == "DOTNET_CLI_HOME"));
+        assert!(dir.path().join("target/dotnet-env/cli-home").is_dir());
+        assert!(dir.path().join("target/dotnet-env/nuget-packages").is_dir());
+        assert!(dir.path().join("target/dotnet-env/tmp").is_dir());
     }
 }

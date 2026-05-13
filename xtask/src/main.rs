@@ -4,6 +4,7 @@
 mod build_examples;
 mod build_wasm;
 mod dev;
+mod dotnet;
 mod e2e;
 mod e2e_approve;
 mod license_headers;
@@ -49,6 +50,7 @@ fn main() -> ExitCode {
         Some("build-examples") => run_steps(&[Step::BUILD_EXAMPLES]),
         Some("build-wasm") => run_steps(&[Step::BUILD_WASM]),
         Some("docs") => run_steps(&[Step::DOCS]),
+        Some("dotnet") => dotnet::run(),
         Some("bench") => {
             let target = args.get(2).map(|s| s.as_str());
             let extra_args: Vec<&str> = args.iter().skip(3).map(String::as_str).collect();
@@ -123,12 +125,13 @@ fn usage() -> ExitCode {
            build-examples  Build all example integrations and apps\n  \
            build-wasm  Build WASM playground module\n  \
            docs    Build the documentation site\n  \
+           dotnet  Build the native FFI, then build and test the .NET solution\n  \
            bench <name> [-- <criterion args>]  Run benchmarks for a target crate (parser, handler, protocol, expressions, state, webui, all)\n  \
            dev <app>  Run example app in dev mode (server + client watch concurrently)\n  \
            e2e [--update-snapshots]  Run Playwright E2E tests for all example apps\n  \
            e2e-approve [run-id]  Download CI screenshot baselines and apply locally\n  \
            version <semver>  Update version across all Cargo.toml and package.json files\n  \
-           publish-stage [--target <triple|all>] [--profile release] [--native-only|--pack-only]  Stage release artifacts into publish/\n  \
+           publish-stage [--target <triple|all>] [--profile release] [--native-only|--nuget-only|--pack-only]  Stage release artifacts into publish/\n  \
            license-headers [--fix]  Check (or fix) license headers in source files\n  \
            proto  Regenerate src/gen_webui.rs from proto/webui.proto"
     );

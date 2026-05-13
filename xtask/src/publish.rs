@@ -11,7 +11,9 @@
 //! - `publish/crates/`  — `.crate` files from `cargo package`
 //! - `publish/wasm/`    — WASM module + JS glue
 
-use crate::util::{build_command, run_command_quiet};
+use crate::util::{
+    build_command, prepare_dotnet_env, run_command_quiet, run_command_quiet_with_env,
+};
 use crate::version;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,6 +97,7 @@ const PUBLISH_SUBDIRS: &[&str] = &["native", "npm", "nuget", "crates", "wasm"];
 enum StageMode {
     Full,
     NativeOnly,
+    NugetOnly,
     PackOnly,
 }
 
@@ -109,7 +112,7 @@ struct StageOptions {
 
 /// Stage release artifacts into `publish/` and package directories.
 ///
-/// Usage: `cargo xtask publish-stage [--target <triple|all>] [--profile release] [--native-only|--pack-only]`
+/// Usage: `cargo xtask publish-stage [--target <triple|all>] [--profile release] [--native-only|--nuget-only|--pack-only]`
 ///
 /// Pass `--target all` to stage every platform whose build artifacts exist.
 /// If `--target` is omitted, detects the current host platform.
@@ -171,8 +174,8 @@ pub fn run_stage(args: &[String]) -> ExitCode {
     // Phase 1: Stage native binaries (existing behavior + publish/native/)
     if options.mode != StageMode::PackOnly {
         let stage_result = match options.target_triple.as_deref() {
-            Some("all") => stage_all_platforms(&root, &options.profile),
-            Some(triple) => stage_one_platform(&root, triple, &options.profile),
+            Some("all") => stage_all_platforms(&root, &options.profile, options.mode),
+            Some(triple) => stage_one_platform(&root, triple, &options.profile, options.mode),
             None => {
                 let host = detect_host_triple();
                 eprintln!(
@@ -180,7 +183,7 @@ pub fn run_stage(args: &[String]) -> ExitCode {
                     console::style("▸").cyan().bold(),
                     console::style(&host).bold(),
                 );
-                stage_one_platform(&root, &host, &options.profile)
+                stage_one_platform(&root, &host, &options.profile, options.mode)
             }
         };
 
@@ -198,20 +201,7 @@ pub fn run_stage(args: &[String]) -> ExitCode {
         }
     }
 
-    // Phase 2: Pack npm tarballs
-    eprintln!(
-        "\n{} Packing npm tarballs",
-        console::style("▸").cyan().bold(),
-    );
-    if let Err(e) = pack_npm_tarballs(&root) {
-        eprintln!(
-            "  {} npm pack failed: {e}",
-            console::style("✘").red().bold(),
-        );
-        return ExitCode::FAILURE;
-    }
-
-    // Phase 3: Pack NuGet packages
+    // Phase 2: Pack NuGet packages
     eprintln!(
         "\n{} Packing NuGet packages",
         console::style("▸").cyan().bold(),
@@ -219,6 +209,28 @@ pub fn run_stage(args: &[String]) -> ExitCode {
     if let Err(e) = pack_nuget_packages(&root) {
         eprintln!(
             "  {} NuGet pack failed: {e}",
+            console::style("✘").red().bold(),
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if options.mode == StageMode::NugetOnly {
+        eprintln!(
+            "\n{} NuGet artifacts staged in {}\n",
+            console::style("✨").green(),
+            console::style("publish/nuget").bold(),
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // Phase 3: Pack npm tarballs
+    eprintln!(
+        "\n{} Packing npm tarballs",
+        console::style("▸").cyan().bold(),
+    );
+    if let Err(e) = pack_npm_tarballs(&root) {
+        eprintln!(
+            "  {} npm pack failed: {e}",
             console::style("✘").red().bold(),
         );
         return ExitCode::FAILURE;
@@ -267,7 +279,7 @@ fn prepare_publish_dirs(root: &Path, mode: StageMode) -> Result<(), String> {
     let publish_dir = root.join("publish");
 
     match mode {
-        StageMode::Full | StageMode::NativeOnly => {
+        StageMode::Full | StageMode::NativeOnly | StageMode::NugetOnly => {
             if publish_dir.exists() {
                 fs::remove_dir_all(&publish_dir)
                     .map_err(|e| format!("failed to clean publish/: {e}"))?;
@@ -322,6 +334,9 @@ fn parse_stage_options(args: &[String]) -> Result<StageOptions, String> {
             "--native-only" => {
                 mode = set_stage_mode(mode, StageMode::NativeOnly)?;
             }
+            "--nuget-only" => {
+                mode = set_stage_mode(mode, StageMode::NugetOnly)?;
+            }
             "--pack-only" => {
                 mode = set_stage_mode(mode, StageMode::PackOnly)?;
             }
@@ -339,7 +354,7 @@ fn parse_stage_options(args: &[String]) -> Result<StageOptions, String> {
 
 fn set_stage_mode(current: StageMode, requested: StageMode) -> Result<StageMode, String> {
     if current != StageMode::Full && current != requested {
-        return Err("cannot combine --native-only and --pack-only".to_string());
+        return Err("cannot combine stage modes; choose only one of --native-only, --nuget-only, or --pack-only".to_string());
     }
 
     Ok(requested)
@@ -348,7 +363,7 @@ fn set_stage_mode(current: StageMode, requested: StageMode) -> Result<StageMode,
 // ── Phase 1: Native binary staging ──────────────────────────────────────
 
 /// Stage all platforms whose build artifacts exist under target/.
-fn stage_all_platforms(root: &Path, profile: &str) -> ExitCode {
+fn stage_all_platforms(root: &Path, profile: &str, mode: StageMode) -> ExitCode {
     eprintln!(
         "{} Staging all available platforms ({})",
         console::style("▸").cyan().bold(),
@@ -371,7 +386,13 @@ fn stage_all_platforms(root: &Path, profile: &str) -> ExitCode {
         let has_cli = build_dir.join(platform.cli_binary).exists();
         let has_addon = build_dir.join(platform.node_addon).exists();
 
-        if !has_ffi && !has_cli && !has_addon {
+        let has_required_artifacts = if mode == StageMode::NugetOnly {
+            has_ffi
+        } else {
+            has_ffi || has_cli || has_addon
+        };
+
+        if !has_required_artifacts {
             skipped += 1;
             continue;
         }
@@ -382,7 +403,7 @@ fn stage_all_platforms(root: &Path, profile: &str) -> ExitCode {
             console::style(platform.triple).bold(),
         );
 
-        if stage_platform(root, platform, &build_dir) {
+        if stage_platform(root, platform, &build_dir, mode) {
             staged += 1;
         } else {
             failed += 1;
@@ -425,7 +446,7 @@ fn stage_all_platforms(root: &Path, profile: &str) -> ExitCode {
 }
 
 /// Stage a single platform by triple name.
-fn stage_one_platform(root: &Path, triple: &str, profile: &str) -> ExitCode {
+fn stage_one_platform(root: &Path, triple: &str, profile: &str, mode: StageMode) -> ExitCode {
     let Some(platform) = PLATFORMS.iter().find(|p| p.triple == triple) else {
         eprintln!(
             "  {} Unknown target triple: {}",
@@ -451,7 +472,7 @@ fn stage_one_platform(root: &Path, triple: &str, profile: &str) -> ExitCode {
         console::style(profile).dim(),
     );
 
-    if stage_platform(root, platform, &build_dir) {
+    if stage_platform(root, platform, &build_dir, mode) {
         eprintln!(
             "\n  {} All binaries staged for {}",
             console::style("✔").green(),
@@ -468,7 +489,12 @@ fn stage_one_platform(root: &Path, triple: &str, profile: &str) -> ExitCode {
 }
 
 /// Copy all artifacts for a single platform. Returns true if all found files staged.
-fn stage_platform(root: &Path, platform: &PlatformEntry, build_dir: &Path) -> bool {
+fn stage_platform(
+    root: &Path,
+    platform: &PlatformEntry,
+    build_dir: &Path,
+    mode: StageMode,
+) -> bool {
     let mut ok = true;
 
     // NuGet: FFI library → dotnet/runtimes/{rid}/native/
@@ -481,6 +507,10 @@ fn stage_platform(root: &Path, platform: &PlatformEntry, build_dir: &Path) -> bo
         dest_name: platform.ffi_lib,
         label: "nuget",
     });
+
+    if mode == StageMode::NugetOnly {
+        return ok;
+    }
 
     // npm: CLI binary → packages/webui-{platform}/bin/
     ok &= stage_file(&CopySpec {
@@ -635,20 +665,37 @@ fn pack_nuget_packages(root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    // Pack all packable projects (Directory.Build.props controls versioning)
-    run_command_quiet(
-        "dotnet",
-        &[
-            "pack",
-            &dotnet_dir.to_string_lossy(),
-            "--configuration",
-            "Release",
-            "--output",
-            &nuget_out.to_string_lossy(),
-        ],
-        None,
-    )
-    .map_err(|e| format!("dotnet pack failed: {e}"))?;
+    let dotnet_env = prepare_dotnet_env(root)?;
+    let projects = discover_nuget_pack_projects(root);
+
+    for project in &projects {
+        let project_string = project.to_string_lossy().into_owned();
+        eprintln!(
+            "  {} Packing {}",
+            console::style("·").dim(),
+            console::style(
+                project
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+            )
+            .bold(),
+        );
+        run_command_quiet_with_env(
+            "dotnet",
+            &[
+                "pack",
+                &project_string,
+                "--configuration",
+                "Release",
+                "--output",
+                &nuget_out.to_string_lossy(),
+            ],
+            None,
+            &dotnet_env,
+        )
+        .map_err(|e| format!("dotnet pack failed for {}: {e}", project.display()))?;
+    }
 
     // Count produced packages
     let count = count_files_with_extension(&nuget_out, "nupkg");
@@ -658,6 +705,35 @@ fn pack_nuget_packages(root: &Path) -> Result<(), String> {
         console::style(count).bold(),
     );
     Ok(())
+}
+
+fn discover_nuget_pack_projects(root: &Path) -> Vec<PathBuf> {
+    let mut projects = vec![
+        root.join("dotnet/src/Microsoft.WebUI/Microsoft.WebUI.csproj"),
+        root.join("dotnet/tool/Microsoft.WebUI.Tool/Microsoft.WebUI.Tool.csproj"),
+    ];
+
+    for platform in PLATFORMS {
+        let runtime_asset = root
+            .join("dotnet/runtimes")
+            .join(platform.nuget_rid)
+            .join("native")
+            .join(platform.ffi_lib);
+        if !runtime_asset.is_file() {
+            continue;
+        }
+
+        let project_name = format!("Microsoft.WebUI.Runtime.{}", platform.nuget_rid);
+        let project_path = root
+            .join("dotnet/runtime")
+            .join(&project_name)
+            .join(format!("{project_name}.csproj"));
+        if project_path.is_file() {
+            projects.push(project_path);
+        }
+    }
+
+    projects
 }
 
 // ── Phase 4: Rust crate packaging ───────────────────────────────────────
@@ -950,11 +1026,57 @@ mod tests {
     }
 
     #[test]
+    fn parse_stage_options_supports_nuget_only_mode() {
+        let options =
+            parse(&["--target", "all", "--nuget-only"]).expect("nuget-only options should parse");
+
+        assert_eq!(options.target_triple.as_deref(), Some("all"));
+        assert_eq!(options.profile, "release");
+        assert_eq!(options.mode, StageMode::NugetOnly);
+    }
+
+    #[test]
     fn parse_stage_options_rejects_conflicting_modes() {
         let error =
             parse(&["--native-only", "--pack-only"]).expect_err("conflicting modes should fail");
 
         assert!(error.contains("cannot combine"));
+    }
+
+    #[test]
+    fn stage_platform_nuget_only_succeeds_with_only_ffi() {
+        let dir = match tempfile::TempDir::new() {
+            Ok(dir) => dir,
+            Err(error) => panic!("{error}"),
+        };
+        let build_dir = dir.path().join("target/release");
+        if let Err(error) = fs::create_dir_all(&build_dir) {
+            panic!("{error}");
+        }
+        if let Err(error) = fs::write(build_dir.join("libwebui_ffi.so"), "ffi") {
+            panic!("{error}");
+        }
+
+        let platform = PlatformEntry {
+            triple: "x86_64-unknown-linux-gnu",
+            npm_package: "webui-linux-x64",
+            nuget_rid: "linux-x64",
+            ffi_lib: "libwebui_ffi.so",
+            node_addon: "libwebui_node.so",
+            cli_binary: "webui",
+            platform_suffix: "linux-x64",
+        };
+
+        assert!(stage_platform(
+            dir.path(),
+            &platform,
+            &build_dir,
+            StageMode::NugetOnly
+        ));
+        assert!(dir
+            .path()
+            .join("dotnet/runtimes/linux-x64/native/libwebui_ffi.so")
+            .is_file());
     }
 
     #[test]
@@ -1043,6 +1165,77 @@ mod tests {
         assert_eq!(count_files_with_extension(dir.path(), "crate"), 2);
         assert_eq!(count_files_with_extension(dir.path(), "txt"), 1);
         assert_eq!(count_files_with_extension(dir.path(), "nupkg"), 0);
+    }
+
+    #[test]
+    fn test_discover_nuget_pack_projects_includes_staged_runtime_packages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("dotnet/src/Microsoft.WebUI")).unwrap();
+        fs::create_dir_all(root.join("dotnet/tool/Microsoft.WebUI.Tool")).unwrap();
+        fs::write(
+            root.join("dotnet/src/Microsoft.WebUI/Microsoft.WebUI.csproj"),
+            "<Project />",
+        )
+        .unwrap();
+        fs::write(
+            root.join("dotnet/tool/Microsoft.WebUI.Tool/Microsoft.WebUI.Tool.csproj"),
+            "<Project />",
+        )
+        .unwrap();
+
+        let runtime_project = root.join("dotnet/runtime/Microsoft.WebUI.Runtime.linux-x64");
+        fs::create_dir_all(&runtime_project).unwrap();
+        fs::write(
+            runtime_project.join("Microsoft.WebUI.Runtime.linux-x64.csproj"),
+            "<Project />",
+        )
+        .unwrap();
+        let runtime_asset = root.join("dotnet/runtimes/linux-x64/native");
+        fs::create_dir_all(&runtime_asset).unwrap();
+        fs::write(runtime_asset.join("libwebui_ffi.so"), "ffi").unwrap();
+
+        let projects = discover_nuget_pack_projects(root);
+        let project_paths = projects
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(project_paths
+            .contains(&"dotnet/src/Microsoft.WebUI/Microsoft.WebUI.csproj".to_string()));
+        assert!(project_paths
+            .contains(&"dotnet/tool/Microsoft.WebUI.Tool/Microsoft.WebUI.Tool.csproj".to_string()));
+        assert!(project_paths.contains(
+            &"dotnet/runtime/Microsoft.WebUI.Runtime.linux-x64/Microsoft.WebUI.Runtime.linux-x64.csproj".to_string(),
+        ));
+    }
+
+    #[test]
+    fn test_discover_nuget_pack_projects_skips_unstaged_runtime_packages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("dotnet/src/Microsoft.WebUI")).unwrap();
+        fs::create_dir_all(root.join("dotnet/tool/Microsoft.WebUI.Tool")).unwrap();
+        fs::write(
+            root.join("dotnet/src/Microsoft.WebUI/Microsoft.WebUI.csproj"),
+            "<Project />",
+        )
+        .unwrap();
+        fs::write(
+            root.join("dotnet/tool/Microsoft.WebUI.Tool/Microsoft.WebUI.Tool.csproj"),
+            "<Project />",
+        )
+        .unwrap();
+
+        let projects = discover_nuget_pack_projects(root);
+        assert_eq!(projects.len(), 2);
     }
 
     #[test]

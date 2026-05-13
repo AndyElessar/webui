@@ -2,7 +2,9 @@
 // Licensed under the MIT license.
 
 using System;
+using System.IO;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace Microsoft.WebUI;
@@ -10,7 +12,7 @@ namespace Microsoft.WebUI;
 /// <summary>
 /// Internal P/Invoke bindings to the native <c>webui_ffi</c> library.
 /// </summary>
-internal static class NativeBindings
+internal static partial class NativeBindings
 {
     private const string LibName = "webui_ffi";
 
@@ -56,12 +58,25 @@ internal static class NativeBindings
             return IntPtr.Zero;
         }
 
+        IntPtr handle;
+
         // Allow overriding the native library path via environment variable.
         string? customPath = Environment.GetEnvironmentVariable("WEBUI_LIB_PATH");
-        if (!string.IsNullOrEmpty(customPath) &&
-            NativeLibrary.TryLoad(customPath, out IntPtr handle))
+        if (!string.IsNullOrEmpty(customPath))
         {
-            return handle;
+            if (NativeLibrary.TryLoad(customPath, out handle))
+            {
+                return handle;
+            }
+
+            if (Directory.Exists(customPath))
+            {
+                string candidatePath = Path.Combine(customPath, GetPlatformLibraryFileName());
+                if (NativeLibrary.TryLoad(candidatePath, out handle))
+                {
+                    return handle;
+                }
+            }
         }
 
         // Fall back to default resolution.
@@ -73,38 +88,70 @@ internal static class NativeBindings
         return IntPtr.Zero;
     }
 
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "webui_handler_create")]
-    private static extern IntPtr webui_handler_create_raw();
+    private static string GetPlatformLibraryFileName()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return "webui_ffi.dll";
+        }
 
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "webui_handler_create_with_plugin")]
-    private static extern IntPtr webui_handler_create_with_plugin_raw(
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string? pluginId);
+        if (OperatingSystem.IsMacOS())
+        {
+            return "libwebui_ffi.dylib";
+        }
 
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "webui_handler_destroy")]
-    private static extern void webui_handler_destroy_raw(IntPtr handlerPtr);
+        return "libwebui_ffi.so";
+    }
 
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr webui_handler_render(
+    [LibraryImport(LibName, EntryPoint = "webui_handler_create")]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    private static partial IntPtr webui_handler_create_raw();
+
+    [LibraryImport(LibName, EntryPoint = "webui_handler_create_with_plugin", StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    private static partial IntPtr webui_handler_create_with_plugin_raw(string? pluginId);
+
+    [LibraryImport(LibName, EntryPoint = "webui_handler_destroy")]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    private static partial void webui_handler_destroy_raw(IntPtr handlerPtr);
+
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void webui_handler_set_nonce(
         WebUIHandlerSafeHandle handlerPtr,
-        byte[] protocolData,
-        nuint protocolLen,
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string dataJson,
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string entryId,
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string requestPath);
+        string? nonce);
 
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr webui_render(
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string html,
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string dataJson);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr webui_render_partial(
-        byte[] protocolData,
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial IntPtr webui_handler_render(
+        WebUIHandlerSafeHandle handlerPtr,
+        [In] byte[] protocolData,
         nuint protocolLen,
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string stateJson,
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string entryId,
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string requestPath,
-        [MarshalAs(UnmanagedType.LPUTF8Str)] string inventoryHex);
+        string dataJson,
+        string entryId,
+        string requestPath);
+
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial IntPtr webui_render(string html, string dataJson);
+
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial IntPtr webui_render_partial(
+        [In] byte[] protocolData,
+        nuint protocolLen,
+        string stateJson,
+        string entryId,
+        string requestPath,
+        string inventoryHex);
+
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial IntPtr webui_render_component_templates(
+        [In] byte[] protocolData,
+        nuint protocolLen,
+        string componentTagsJson,
+        string inventoryHex);
 
     internal static WebUIHandlerSafeHandle CreateHandler(string? pluginId)
     {
@@ -114,11 +161,19 @@ internal static class NativeBindings
         return new WebUIHandlerSafeHandle(handle);
     }
 
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern void webui_free(IntPtr stringPtr);
+    [LibraryImport(LibName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void webui_free(IntPtr stringPtr);
 
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr webui_last_error();
+    [LibraryImport(LibName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial IntPtr webui_last_error();
+
+    [LibraryImport(LibName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial IntPtr webui_protocol_tokens(
+        [In] byte[] protocolData,
+        nuint protocolLen);
 
     /// <summary>
     /// Reads a UTF-8 string from a native pointer and frees the native memory.

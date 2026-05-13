@@ -58,7 +58,8 @@ All development tasks go through `cargo xtask`:
 | `cargo xtask bench <crate>` | Run benchmarks (parser, handler, protocol, expressions, state, all) |
 | `cargo xtask dev <app>` | Run example app in dev mode |
 | `cargo xtask version <semver>` | Update version across all Cargo.toml and package.json files |
-| `cargo xtask publish-stage` | Stage release artifacts into `publish/` (supports `--native-only` and `--pack-only`) |
+| `cargo xtask publish-stage` | Stage release artifacts into `publish/` (supports `--native-only`, `--nuget-only`, and `--pack-only`) |
+| `cargo xtask dotnet` | Build the native FFI, then build and test the .NET solution |
 
 ### CI Pipelines
 
@@ -124,7 +125,7 @@ once on Linux to build the final `publish/` folder:
 | Subfolder | Contents | Target registry |
 |-----------|----------|-----------------|
 | `publish/npm/` | `.tgz` tarballs (8 packages) | npmjs |
-| `publish/nuget/` | `.nupkg` files (2 packages) | NuGet |
+| `publish/nuget/` | `.nupkg` files for the managed package, tool, and staged runtime packages | NuGet |
 | `publish/crates/` | `.crate` files (12 crates) | crates.io |
 | `publish/wasm/` | `.wasm` + `.js` glue | CDN / static hosting |
 | `publish/native/` | CLI binaries per platform | Direct download |

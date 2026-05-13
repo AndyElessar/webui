@@ -2,16 +2,16 @@
 // Licensed under the MIT license.
 
 using System;
-using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Microsoft.WebUI;
 
 /// <summary>
 /// Manages a WebUI handler instance for protocol-based rendering.
-/// Use this for repeated renders with pre-compiled protocol data.
-/// <para>This type is thread-safe. The native handler creates per-render state
-/// internally, so concurrent renders do not contend.</para>
+/// Use this for a single full-page render with pre-compiled protocol data.
+/// <para>This type wraps a native handler instance and is not thread-safe.
+/// Create and dispose a new instance per request, especially when setting a
+/// CSP nonce for that response.</para>
 /// </summary>
 public sealed class WebUIHandler : IDisposable
 {
@@ -73,6 +73,25 @@ public sealed class WebUIHandler : IDisposable
     }
 
     /// <summary>
+    /// Sets or clears the CSP nonce used for inline tags emitted by this handler instance.
+    /// </summary>
+    /// <param name="nonce">The per-request nonce value to emit, or <c>null</c> to clear it.</param>
+    /// <exception cref="ObjectDisposedException">Thrown when the handler has been disposed.</exception>
+    /// <exception cref="WebUIException">Thrown when the operation fails.</exception>
+    public void SetNonce(string? nonce)
+    {
+        ThrowIfDisposed();
+
+        NativeBindings.webui_handler_set_nonce(_handle, nonce);
+
+        string? error = NativeBindings.GetLastError();
+        if (error is not null)
+        {
+            throw new WebUIException(error);
+        }
+    }
+
+    /// <summary>
     /// Produces a complete JSON partial response for client-side navigation.
     /// Combines application state, route templates, inventory, request path, and
     /// matched route chain in a single call — no assembly required.
@@ -88,27 +107,7 @@ public sealed class WebUIHandler : IDisposable
     public string RenderPartial(byte[] protocol, string stateJson, string entryId, string requestPath, string inventoryHex)
     {
         ThrowIfDisposed();
-        ArgumentNullException.ThrowIfNull(protocol);
-        ArgumentNullException.ThrowIfNull(stateJson);
-        ArgumentNullException.ThrowIfNull(entryId);
-        ArgumentNullException.ThrowIfNull(requestPath);
-        ArgumentNullException.ThrowIfNull(inventoryHex);
-
-        IntPtr resultPtr = NativeBindings.webui_render_partial(
-            protocol,
-            (nuint)protocol.Length,
-            stateJson,
-            entryId,
-            requestPath,
-            inventoryHex);
-
-        if (resultPtr == IntPtr.Zero)
-        {
-            string error = NativeBindings.GetLastError() ?? "RenderPartial failed.";
-            throw new WebUIException(error);
-        }
-
-        return NativeBindings.ReadAndFreeString(resultPtr)!;
+        return WebUIRenderer.RenderPartial(protocol, stateJson, entryId, requestPath, inventoryHex);
     }
 
     /// <summary>
@@ -116,7 +115,11 @@ public sealed class WebUIHandler : IDisposable
     /// </summary>
     public void Dispose()
     {
-        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0) return;
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
+        {
+            return;
+        }
+
         _handle.Dispose();
     }
 
