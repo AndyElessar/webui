@@ -126,7 +126,10 @@ fn usage() -> ExitCode {
            build-wasm  Build WASM playground module\n  \
            docs    Build the documentation site\n  \
            dotnet  Build the native FFI, then build and test the .NET solution\n  \
-           bench <name> [-- <criterion args>]  Run benchmarks for a target crate (parser, handler, protocol, expressions, state, webui, all)\n  \
+           bench <target> [-- <extra>] [--save-baseline NAME | --baseline NAME]\n  \
+                       Targets: parser, handler, protocol, expressions, state, contact-book, streaming, all\n  \
+                       Streaming-only: streaming-resource, streaming-e2e-ttfb, streaming-browser, streaming-all/full\n  \
+                       Baselines: --save-baseline NAME records, --baseline NAME compares\n  \
            dev <app>  Run example app in dev mode (server + client watch concurrently)\n  \
            e2e [--update-snapshots]  Run Playwright E2E tests for all example apps\n  \
            e2e-approve [run-id]  Download CI screenshot baselines and apply locally\n  \
@@ -139,42 +142,267 @@ fn usage() -> ExitCode {
 }
 
 fn bench(target: Option<&str>, extra_args: &[&str]) -> ExitCode {
-    let mut args = vec!["bench"];
-
-    match target {
-        Some("parser") | Some("webui-parser") | Some("microsoft-webui-parser") => {
-            args.extend(["-p", "microsoft-webui-parser"]);
-        }
-        Some("handler") | Some("webui-handler") | Some("microsoft-webui-handler") => {
-            args.extend(["-p", "microsoft-webui-handler"]);
-        }
-        Some("protocol") | Some("webui-protocol") | Some("microsoft-webui-protocol") => {
-            args.extend(["-p", "microsoft-webui-protocol"]);
-        }
-        Some("expressions") | Some("webui-expressions") | Some("microsoft-webui-expressions") => {
-            args.extend(["-p", "microsoft-webui-expressions"]);
-        }
-        Some("state") | Some("webui-state") | Some("microsoft-webui-state") => {
-            args.extend(["-p", "microsoft-webui-state"]);
-        }
-        Some("contact-book") => {
-            args.extend(["-p", "microsoft-webui", "--bench", "contact_book_bench"]);
-        }
-        Some("all") | None => {
-            args.extend(["--workspace"]);
-        }
-        Some(other) => {
-            eprintln!("Unknown bench target '{other}'. Supported targets: parser, handler, protocol, expressions, state, webui, all");
-            return ExitCode::FAILURE;
+    // Parse our own --save-baseline NAME / --baseline NAME flags out of
+    // the extra args. These map to:
+    //   * criterion benches: passed through as `--save-baseline`/`--baseline`
+    //   * resource & e2e-ttfb examples: `--save NAME` / `--compare NAME`
+    //   * browser bench: `WEBUI_BENCH_SAVE` / `WEBUI_BENCH_COMPARE` env vars
+    let mut save_baseline: Option<String> = None;
+    let mut compare_baseline: Option<String> = None;
+    let mut criterion_args: Vec<&str> = Vec::with_capacity(extra_args.len());
+    let mut iter = extra_args.iter();
+    while let Some(&a) = iter.next() {
+        match a {
+            "--save-baseline" => {
+                if let Some(name) = iter.next() {
+                    save_baseline = Some((*name).to_string());
+                } else {
+                    eprintln!("--save-baseline requires a NAME");
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--baseline" => {
+                if let Some(name) = iter.next() {
+                    compare_baseline = Some((*name).to_string());
+                } else {
+                    eprintln!("--baseline requires a NAME");
+                    return ExitCode::FAILURE;
+                }
+            }
+            other => criterion_args.push(other),
         }
     }
 
-    args.extend(extra_args.iter().copied());
+    match target {
+        Some("streaming-resource") => bench_resource(save_baseline, compare_baseline),
+        Some("streaming-e2e-ttfb") => bench_e2e_ttfb(save_baseline, compare_baseline),
+        Some("streaming-browser") => bench_browser(save_baseline, compare_baseline),
+        Some("streaming-all") | Some("full") => {
+            // The full bench suite: criterion micro + resource + e2e + browser.
+            // Each phase passes through the baseline flags.
+            type BenchPhase = fn(Option<String>, Option<String>) -> ExitCode;
+            let phases: &[(&str, BenchPhase)] = &[
+                ("criterion (microsoft-webui)", bench_webui_criterion_phase),
+                ("streaming-resource", bench_resource),
+                ("streaming-e2e-ttfb", bench_e2e_ttfb),
+                ("streaming-browser", bench_browser),
+            ];
+            for (label, f) in phases {
+                eprintln!(
+                    "\n{} {}",
+                    console::style("▸").cyan().bold(),
+                    console::style(label).bold()
+                );
+                let rc = f(save_baseline.clone(), compare_baseline.clone());
+                if rc != ExitCode::SUCCESS {
+                    eprintln!(
+                        "{} {} failed; aborting --full run",
+                        console::style("✘").red().bold(),
+                        label
+                    );
+                    return rc;
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            // Criterion path (existing behaviour). Pass baseline flags
+            // through as criterion's native flags.
+            let mut args: Vec<String> = vec!["bench".to_string()];
+            match target {
+                Some("parser") | Some("webui-parser") | Some("microsoft-webui-parser") => {
+                    args.push("-p".into());
+                    args.push("microsoft-webui-parser".into());
+                }
+                Some("handler") | Some("webui-handler") | Some("microsoft-webui-handler") => {
+                    args.push("-p".into());
+                    args.push("microsoft-webui-handler".into());
+                }
+                Some("protocol") | Some("webui-protocol") | Some("microsoft-webui-protocol") => {
+                    args.push("-p".into());
+                    args.push("microsoft-webui-protocol".into());
+                }
+                Some("expressions")
+                | Some("webui-expressions")
+                | Some("microsoft-webui-expressions") => {
+                    args.push("-p".into());
+                    args.push("microsoft-webui-expressions".into());
+                }
+                Some("state") | Some("webui-state") | Some("microsoft-webui-state") => {
+                    args.push("-p".into());
+                    args.push("microsoft-webui-state".into());
+                }
+                Some("contact-book") => {
+                    args.push("-p".into());
+                    args.push("microsoft-webui".into());
+                    args.push("--bench".into());
+                    args.push("contact_book_bench".into());
+                }
+                Some("streaming") => {
+                    args.push("-p".into());
+                    args.push("microsoft-webui".into());
+                    args.push("--bench".into());
+                    args.push("streaming_bench".into());
+                }
+                Some("all") | None => {
+                    args.push("--workspace".into());
+                }
+                Some(other) => {
+                    eprintln!(
+                        "Unknown bench target '{other}'.\n\
+                         Criterion targets: parser, handler, protocol, expressions, state, \
+                         contact-book, streaming, all.\n\
+                         Non-criterion targets: streaming-resource, streaming-e2e-ttfb, \
+                         streaming-browser, streaming-all (= full)."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+            // Pass baseline flags through to criterion via `-- --save-baseline NAME`.
+            // Use the Vec-indexed marker so we add `--` exactly once.
+            let needs_dash_dash =
+                save_baseline.is_some() || compare_baseline.is_some() || !criterion_args.is_empty();
+            if needs_dash_dash {
+                args.push("--".into());
+            }
+            for ea in &criterion_args {
+                args.push((*ea).to_string());
+            }
+            if let Some(name) = save_baseline.as_ref() {
+                args.push("--save-baseline".into());
+                args.push(name.clone());
+            }
+            if let Some(name) = compare_baseline.as_ref() {
+                args.push("--baseline".into());
+                args.push(name.clone());
+            }
 
-    match run_command("cargo", &args, None) {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            match run_command("cargo", &arg_refs, None) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("bench failed: {message}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn bench_webui_criterion_phase(save: Option<String>, compare: Option<String>) -> ExitCode {
+    let mut args: Vec<String> = vec![
+        "bench".into(),
+        "-p".into(),
+        "microsoft-webui".into(),
+        "--bench".into(),
+        "streaming_bench".into(),
+    ];
+    if save.is_some() || compare.is_some() {
+        args.push("--".into());
+        if let Some(name) = save {
+            args.push("--save-baseline".into());
+            args.push(name);
+        }
+        if let Some(name) = compare {
+            args.push("--baseline".into());
+            args.push(name);
+        }
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_command("cargo", &arg_refs, None) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("bench failed: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn bench_resource(save: Option<String>, compare: Option<String>) -> ExitCode {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--release".into(),
+        "--example".into(),
+        "streaming_resource_bench".into(),
+        "-p".into(),
+        "microsoft-webui".into(),
+    ];
+    if save.is_some() || compare.is_some() {
+        args.push("--".into());
+        if let Some(name) = save {
+            args.push("--save".into());
+            args.push(name);
+        }
+        if let Some(name) = compare {
+            args.push("--compare".into());
+            args.push(name);
+        }
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_command("cargo", &arg_refs, None) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("streaming-resource bench failed: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn bench_e2e_ttfb(save: Option<String>, compare: Option<String>) -> ExitCode {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--release".into(),
+        "--example".into(),
+        "streaming_e2e_ttfb_bench".into(),
+        "-p".into(),
+        "microsoft-webui".into(),
+    ];
+    if save.is_some() || compare.is_some() {
+        args.push("--".into());
+        if let Some(name) = save {
+            args.push("--save".into());
+            args.push(name);
+        }
+        if let Some(name) = compare {
+            args.push("--compare".into());
+            args.push(name);
+        }
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_command("cargo", &arg_refs, None) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("streaming-e2e-ttfb bench failed: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn bench_browser(save: Option<String>, compare: Option<String>) -> ExitCode {
+    use std::process::Command;
+    let bench_dir = std::path::PathBuf::from("examples")
+        .join("integration")
+        .join("streaming-browser-bench");
+    if !bench_dir.join("package.json").exists() {
+        eprintln!("streaming-browser bench: {} not found", bench_dir.display());
+        return ExitCode::FAILURE;
+    }
+    let mut cmd = Command::new("pnpm");
+    cmd.arg("test").current_dir(&bench_dir);
+    if let Some(name) = save.as_ref() {
+        cmd.env("WEBUI_BENCH_SAVE", name);
+    }
+    if let Some(name) = compare.as_ref() {
+        cmd.env("WEBUI_BENCH_COMPARE", name);
+    }
+    match cmd.status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => {
+            eprintln!("streaming-browser bench exited with {status}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("streaming-browser bench: failed to spawn pnpm: {e}");
             ExitCode::FAILURE
         }
     }
@@ -342,6 +570,14 @@ impl Step {
     const BENCH_VALIDATE: Self = Self {
         name: "bench (validate)",
         run: || {
+            // Use the dev profile (not the default bench profile) for the
+            // criterion `--test` smoke run. The bench profile inherits the
+            // release profile's `lto = true, codegen-units = 1`, which spends
+            // ~40s compiling the full graph just to assert criterion's
+            // `--test` entry point runs once. The dev profile reuses the
+            // already-built unit-test artifacts and finishes in seconds. Real
+            // benchmark measurements (via `cargo xtask bench`) continue to
+            // use the unchanged bench profile so their numbers stay accurate.
             run_command_quiet(
                 "cargo",
                 &[
@@ -350,6 +586,7 @@ impl Step {
                     "microsoft-webui",
                     "--bench",
                     "contact_book_bench",
+                    "--profile=dev",
                     "--",
                     "--test",
                 ],
