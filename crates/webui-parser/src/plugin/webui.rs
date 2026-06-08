@@ -60,6 +60,7 @@
 //!    compiles each tracked component into a raw JS IIFE string.
 
 use super::{AttributeAction, ParserPlugin, ParserPluginArtifacts};
+use crate::comment_policy;
 use crate::component_registry::Component;
 use crate::tag_scan::find_tag_close;
 use crate::{ConditionParser, DomStrategy, ParserOptions, Result};
@@ -877,33 +878,21 @@ fn compile_section(input: &str, blocks: &mut Vec<TemplateSectionMeta>) -> Templa
             continue;
         }
 
-        // Triple-brace {{{expr}}} → marker + text binding (raw/unescaped)
-        if i + 4 < len && bytes[i] == b'{' && bytes[i + 1] == b'{' && bytes[i + 2] == b'{' {
-            if let Some(end) = find_brace_end(input, i + 3, 3) {
-                let expr = input[i + 3..end].trim();
-                let idx = meta.text_bindings.len();
-                meta.text_bindings.push((expr.to_string(), true));
-                meta.html.push_str(&format!("<!--t:{idx}-->"));
-                i = end + 3;
-                continue;
-            }
-        }
-
-        // Double-brace {{expr}} → marker + text binding (escaped)
-        if i + 3 < len && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            if let Some(end) = find_brace_end(input, i + 2, 2) {
-                let expr = input[i + 2..end].trim();
-                let idx = meta.text_bindings.len();
-                meta.text_bindings.push((expr.to_string(), false));
-                meta.html.push_str(&format!("<!--t:{idx}-->"));
-                i = end + 2;
-                continue;
-            }
+        if let Some(next) = compile_text_binding_at(input, i, &mut meta) {
+            i = next;
+            continue;
         }
 
         // <if condition="...">...</if> → marker + conditional
         if bytes[i] == b'<' {
             let remaining = &input[i..];
+            if remaining.starts_with("<!--") {
+                if let Some(close) = remaining.find("-->") {
+                    i += close + 3;
+                    continue;
+                }
+            }
+
             if remaining.starts_with("<if ") || remaining.starts_with("<if\n") {
                 if let Some((cond, body, consumed)) = parse_if_block(remaining) {
                     let block_index = blocks.len();
@@ -931,6 +920,14 @@ fn compile_section(input: &str, blocks: &mut Vec<TemplateSectionMeta>) -> Templa
                     i += consumed;
                     continue;
                 }
+            }
+
+            if let Some((open_end, close_start, close_end)) = find_style_element_bounds(input, i) {
+                meta.html.push_str(&input[i..open_end]);
+                compile_style_content(&input[open_end..close_start], &mut meta);
+                meta.html.push_str(&input[close_start..close_end]);
+                i = close_end;
+                continue;
             }
 
             // <outlet ... /> → keep as <outlet></outlet>
@@ -973,6 +970,146 @@ fn compile_section(input: &str, blocks: &mut Vec<TemplateSectionMeta>) -> Templa
     }
 
     meta
+}
+
+fn compile_text_binding_at(
+    input: &str,
+    index: usize,
+    meta: &mut TemplateSectionMeta,
+) -> Option<usize> {
+    let bytes = input.as_bytes();
+
+    if index + 4 < bytes.len()
+        && bytes[index] == b'{'
+        && bytes[index + 1] == b'{'
+        && bytes[index + 2] == b'{'
+    {
+        if let Some(end) = find_brace_end(input, index + 3, 3) {
+            let expr = input[index + 3..end].trim();
+            let idx = meta.text_bindings.len();
+            meta.text_bindings.push((expr.to_string(), true));
+            let _ = write!(meta.html, "<!--t:{idx}-->");
+            return Some(end + 3);
+        }
+    }
+
+    if index + 3 < bytes.len() && bytes[index] == b'{' && bytes[index + 1] == b'{' {
+        if let Some(end) = find_brace_end(input, index + 2, 2) {
+            let expr = input[index + 2..end].trim();
+            let idx = meta.text_bindings.len();
+            meta.text_bindings.push((expr.to_string(), false));
+            let _ = write!(meta.html, "<!--t:{idx}-->");
+            return Some(end + 2);
+        }
+    }
+
+    None
+}
+
+fn compile_style_content(input: &str, meta: &mut TemplateSectionMeta) {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut index = 0usize;
+
+    while index < len {
+        if index + 1 < len && bytes[index] == b'/' && bytes[index + 1] == b'*' {
+            if let Some(close) = input[index + 2..].find("*/") {
+                let end = index + 2 + close + 2;
+                let comment = &input[index..end];
+                if compile_css_signal_comment(comment, meta) {
+                    index = end;
+                    continue;
+                }
+                if comment_policy::is_legal_css_comment(comment) {
+                    meta.html.push_str(comment);
+                }
+                index = end;
+                continue;
+            }
+        }
+
+        if comment_policy::is_css_line_comment_start(input, index) {
+            let end = comment_policy::find_css_line_comment_end(input, index + 2);
+            let comment = &input[index..end];
+            if comment_policy::is_legal_css_comment(comment) {
+                meta.html.push_str(comment);
+            }
+            index = end;
+            continue;
+        }
+
+        if let Some(next) = compile_text_binding_at(input, index, meta) {
+            index = next;
+            continue;
+        }
+
+        let Some(ch) = input[index..].chars().next() else {
+            break;
+        };
+        meta.html.push(ch);
+        index += ch.len_utf8();
+    }
+}
+
+fn compile_css_signal_comment(comment: &str, meta: &mut TemplateSectionMeta) -> bool {
+    if let Some(signal) = comment_policy::parse_css_signal_comment(comment) {
+        let idx = meta.text_bindings.len();
+        meta.text_bindings.push((signal.path, signal.raw));
+        let _ = write!(meta.html, "<!--t:{idx}-->");
+        return true;
+    }
+
+    false
+}
+
+fn find_style_element_bounds(input: &str, index: usize) -> Option<(usize, usize, usize)> {
+    let remaining = &input[index..];
+    if !starts_with_style_start_tag(remaining) {
+        return None;
+    }
+
+    let open_close = find_tag_close(remaining)?;
+    let content_start = index + open_close + 1;
+    let (close_start, close_end) = find_style_end_tag(input, content_start)?;
+    Some((content_start, close_start, close_end))
+}
+
+fn starts_with_style_start_tag(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    if bytes.len() < 6 || bytes[0] != b'<' || bytes.get(1) == Some(&b'/') {
+        return false;
+    }
+    ascii_starts_with_ignore_case(&bytes[1..], b"style")
+        && bytes
+            .get(6)
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+}
+
+fn find_style_end_tag(input: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = input.as_bytes();
+    let mut index = start;
+
+    while index + 8 <= bytes.len() {
+        if bytes[index] == b'<'
+            && bytes[index + 1] == b'/'
+            && ascii_starts_with_ignore_case(&bytes[index + 2..], b"style")
+            && bytes
+                .get(index + 7)
+                .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+        {
+            let close = find_tag_close(&input[index..])?;
+            return Some((index, index + close + 1));
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn ascii_starts_with_ignore_case(input: &[u8], prefix: &[u8]) -> bool {
+    input
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
 #[derive(Clone)]
@@ -2332,6 +2469,61 @@ mod tests {
         assert!(result.contains("\"title\""));
         assert!(result.contains(r#",tx:[[[[0],0],[["title"]]]]"#));
         assert!(!result.contains("{{"));
+    }
+
+    #[test]
+    fn test_metadata_strips_html_comments_without_processing_bindings() {
+        let result = generate_compiled_template(
+            "my-comp",
+            r#"<!-- {{title}} @click="{bad()}" --><div>hello</div>"#,
+        );
+
+        assert_no_client_markers(&result);
+        assert!(result.contains(r#"h:"<div>hello</div>""#));
+        assert!(!result.contains("title"));
+        assert!(!result.contains("@click"));
+        assert!(!result.contains("-->"));
+    }
+
+    #[test]
+    fn test_metadata_strips_style_comments_without_processing_bindings() {
+        let result = generate_compiled_template(
+            "my-comp",
+            r#"<style>/* prose {{ignored}} */ .x { color: {{color}}; } /*! @license {{kept}} */</style>"#,
+        );
+
+        assert_no_client_markers(&result);
+        assert!(!result.contains("ignored"));
+        assert!(result.contains(r#"["color"]"#));
+        assert!(!result.contains(r#"[["kept"]]"#));
+        assert!(result.contains("/*! @license {{kept}} */"));
+    }
+
+    #[test]
+    fn test_metadata_processes_style_signal_comments() {
+        let result = generate_compiled_template(
+            "my-comp",
+            r#"<style>:root{/*{{{tokens.light}}}*/}</style>"#,
+        );
+
+        assert_no_client_markers(&result);
+        assert!(result.contains(r#"["tokens.light"]"#));
+        assert!(!result.contains("/*"));
+        assert!(!result.contains("*/"));
+    }
+
+    #[test]
+    fn test_metadata_strips_style_line_comments_without_processing_bindings() {
+        let result = generate_compiled_template(
+            "my-comp",
+            "<style>// {{ignored}}\n.x { color: {{color}}; }\n//! @license {{kept}}</style>",
+        );
+
+        assert_no_client_markers(&result);
+        assert!(!result.contains("ignored"));
+        assert!(result.contains(r#"["color"]"#));
+        assert!(!result.contains(r#"[["kept"]]"#));
+        assert!(result.contains("//! @license {{kept}}"));
     }
 
     #[test]

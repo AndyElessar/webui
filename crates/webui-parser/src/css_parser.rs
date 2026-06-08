@@ -6,7 +6,8 @@
 //! This module uses tree-sitter-css to parse CSS files
 //! and process styles for components.
 
-use crate::{ParserError, Result};
+use crate::{comment_policy, LegalComments, ParserError, Result};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 use tree_sitter::{Node, Parser, Tree};
@@ -18,6 +19,20 @@ use tree_sitter_css::LANGUAGE;
 pub struct CssParser {
     /// Tree-sitter parser for CSS.
     parser: Parser,
+}
+
+struct CssWalkContext<'a> {
+    tokens: &'a mut HashSet<String>,
+    definitions: &'a mut HashSet<String>,
+    comments: Option<&'a mut Vec<CssComment>>,
+    legal_comments: LegalComments,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CssComment {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub preserve: bool,
 }
 
 impl fmt::Debug for CssParser {
@@ -115,7 +130,13 @@ impl CssParser {
         let mut tokens = HashSet::new();
         let mut definitions = HashSet::new();
 
-        Self::walk_css_tree(tree.root_node(), css_content, &mut tokens, &mut definitions);
+        let mut context = CssWalkContext {
+            tokens: &mut tokens,
+            definitions: &mut definitions,
+            comments: None,
+            legal_comments: LegalComments::Inline,
+        };
+        Self::walk_css_tree(tree.root_node(), css_content, &mut context);
 
         // Exclude locally-defined custom properties
         tokens.retain(|t| !definitions.contains(t));
@@ -137,7 +158,13 @@ impl CssParser {
         let mut tokens = HashSet::new();
         let mut definitions = HashSet::new();
 
-        Self::walk_css_tree(tree.root_node(), css_content, &mut tokens, &mut definitions);
+        let mut context = CssWalkContext {
+            tokens: &mut tokens,
+            definitions: &mut definitions,
+            comments: None,
+            legal_comments: LegalComments::Inline,
+        };
+        Self::walk_css_tree(tree.root_node(), css_content, &mut context);
 
         Ok(definitions)
     }
@@ -162,31 +189,94 @@ impl CssParser {
         let mut tokens = HashSet::new();
         let mut definitions = HashSet::new();
 
-        Self::walk_css_tree(tree.root_node(), css_content, &mut tokens, &mut definitions);
+        let mut context = CssWalkContext {
+            tokens: &mut tokens,
+            definitions: &mut definitions,
+            comments: None,
+            legal_comments: LegalComments::Inline,
+        };
+        Self::walk_css_tree(tree.root_node(), css_content, &mut context);
 
         // Exclude locally-defined custom properties from tokens
         tokens.retain(|t| !definitions.contains(t));
         Ok((tokens, definitions))
     }
 
+    /// Extract tokens, definitions, and CSS with removable comments stripped in one parse.
+    pub(crate) fn extract_tokens_definitions_and_strip_comments<'a>(
+        &mut self,
+        css_content: &'a str,
+        legal_comments: LegalComments,
+    ) -> Result<(HashSet<String>, HashSet<String>, Cow<'a, str>)> {
+        let tree = self
+            .parser
+            .parse(css_content, None)
+            .ok_or_else(|| ParserError::Css("Failed to parse CSS".into()))?;
+
+        let mut tokens = HashSet::new();
+        let mut definitions = HashSet::new();
+        let mut comments = Vec::new();
+
+        let mut context = CssWalkContext {
+            tokens: &mut tokens,
+            definitions: &mut definitions,
+            comments: Some(&mut comments),
+            legal_comments,
+        };
+        Self::walk_css_tree(tree.root_node(), css_content, &mut context);
+
+        tokens.retain(|t| !definitions.contains(t));
+        let mut comment_ranges = removable_ranges(&comments);
+        let stripped = comment_policy::strip_ranges(css_content, comment_ranges.as_mut_slice());
+        Ok((tokens, definitions, stripped))
+    }
+
+    /// Extract tokens, definitions, and CSS comments in one parse.
+    pub(crate) fn extract_tokens_definitions_and_comments(
+        &mut self,
+        css_content: &str,
+        legal_comments: LegalComments,
+    ) -> Result<(HashSet<String>, HashSet<String>, Vec<CssComment>)> {
+        let tree = self
+            .parser
+            .parse(css_content, None)
+            .ok_or_else(|| ParserError::Css("Failed to parse CSS".into()))?;
+
+        let mut tokens = HashSet::new();
+        let mut definitions = HashSet::new();
+        let mut comments = Vec::new();
+
+        let mut context = CssWalkContext {
+            tokens: &mut tokens,
+            definitions: &mut definitions,
+            comments: Some(&mut comments),
+            legal_comments,
+        };
+        Self::walk_css_tree(tree.root_node(), css_content, &mut context);
+
+        tokens.retain(|t| !definitions.contains(t));
+        comments.sort_unstable_by_key(|comment| comment.start_byte);
+        Ok((tokens, definitions, comments))
+    }
+
     /// Iteratively walk the CSS tree to collect var() usages and custom
     /// property definitions. Uses an explicit stack instead of recursion.
     #[allow(clippy::cast_possible_truncation)] // tree-sitter child indices are u32
-    fn walk_css_tree(
-        root: Node<'_>,
-        source: &str,
-        tokens: &mut HashSet<String>,
-        definitions: &mut HashSet<String>,
-    ) {
+    fn walk_css_tree(root: Node<'_>, source: &str, context: &mut CssWalkContext<'_>) {
         let mut stack = vec![root];
 
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "call_expression" => {
-                    Self::extract_var_tokens(node, source, tokens);
+                    Self::extract_var_tokens(node, source, context.tokens);
                 }
                 "declaration" => {
-                    Self::collect_custom_property_definition(node, source, definitions);
+                    Self::collect_custom_property_definition(node, source, context.definitions);
+                }
+                kind if comment_policy::is_css_comment_node(kind) => {
+                    if let Some(comments) = context.comments.as_deref_mut() {
+                        Self::push_comment(source, node, context.legal_comments, comments);
+                    }
                 }
                 _ => {}
             }
@@ -199,6 +289,20 @@ impl CssParser {
                 }
             }
         }
+    }
+
+    fn push_comment(
+        source: &str,
+        node: Node<'_>,
+        legal_comments: LegalComments,
+        comments: &mut Vec<CssComment>,
+    ) {
+        let comment = &source[node.start_byte()..node.end_byte()];
+        comments.push(CssComment {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            preserve: comment_policy::should_preserve_css_comment(comment, legal_comments),
+        });
     }
 
     /// If `node` is a `var()` call expression, extract its `plain_value`
@@ -251,6 +355,16 @@ impl CssParser {
             }
         }
     }
+}
+
+fn removable_ranges(comments: &[CssComment]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::with_capacity(comments.len());
+    for comment in comments {
+        if !comment.preserve {
+            ranges.push((comment.start_byte, comment.end_byte));
+        }
+    }
+    ranges
 }
 
 impl Default for CssParser {
@@ -445,6 +559,43 @@ mod tests {
             defs,
             HashSet::from(["brand".to_string(), "radius".to_string()])
         );
+    }
+
+    #[test]
+    fn test_strip_line_css_comments() {
+        let css = "// var(--ignored)\n.btn { color: var(--textColor); }";
+        let mut parser = CssParser::new();
+        let (tokens, _defs, stripped) = parser
+            .extract_tokens_definitions_and_strip_comments(css, LegalComments::Inline)
+            .expect("failed");
+
+        assert_eq!(tokens, HashSet::from(["textColor".to_string()]));
+        assert_eq!(stripped.as_ref(), "\n.btn { color: var(--textColor); }");
+    }
+
+    #[test]
+    fn test_preserve_legal_line_css_comments_by_default() {
+        let css = "//! @license MIT\n.btn { color: red; }\n// remove";
+        let mut parser = CssParser::new();
+        let (_tokens, _defs, stripped) = parser
+            .extract_tokens_definitions_and_strip_comments(css, LegalComments::Inline)
+            .expect("failed");
+
+        assert_eq!(
+            stripped.as_ref(),
+            "//! @license MIT\n.btn { color: red; }\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_legal_line_css_comments_when_disabled() {
+        let css = "//! @license MIT\n.btn { color: red; }";
+        let mut parser = CssParser::new();
+        let (_tokens, _defs, stripped) = parser
+            .extract_tokens_definitions_and_strip_comments(css, LegalComments::None)
+            .expect("failed");
+
+        assert_eq!(stripped.as_ref(), "\n.btn { color: red; }");
     }
 
     #[test]
