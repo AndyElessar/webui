@@ -6,6 +6,7 @@ Pick the handler that matches your stack:
 
 - [**Rust**](./rust), High-performance native rendering with the Rust programming language
 - [**Node**](./node), Streaming SSR via a native addon built with napi-rs for Node, Bun, and Deno.
+- [**.NET**](/guide/installation#net), Managed `Microsoft.WebUI` NuGet bindings with transitive native runtime packages
 - [**Electron**](./electron), Desktop apps via Electron with custom `webui://` protocol
 - [**WebAssembly**](./wasm), Split parser, handler, and combined browser bundles
 - [**C / FFI**](./ffi), Shared library for Go, C#, Python, and any language with C interop
