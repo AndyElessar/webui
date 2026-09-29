@@ -39,6 +39,15 @@ pub enum CliError {
         port: u16,
     },
 
+    /// `--port 0` cannot be used with listening-port Host validation.
+    InvalidServePort,
+
+    /// An `--allowed-host` value is not a valid exact HTTP Host authority.
+    InvalidAllowedHost {
+        /// The rejected value.
+        host: String,
+    },
+
     /// The entry file could not be read.
     EntryReadFailed {
         /// The path that could not be read.
@@ -66,6 +75,10 @@ impl fmt::Display for CliError {
             CliError::PortInUse { port } => {
                 write!(f, "Port {port} on 127.0.0.1 is already in use")
             }
+            CliError::InvalidServePort => write!(f, "Invalid --port: 0 is not supported"),
+            CliError::InvalidAllowedHost { host } => {
+                write!(f, "Invalid --allowed-host value: {host}")
+            }
             CliError::EntryReadFailed { path } => write!(f, "Failed to read entry file: {path}"),
             CliError::DesktopBinaryNotFound { binary } => {
                 write!(f, "Desktop sidecar backend not found: {binary}")
@@ -90,6 +103,10 @@ impl CliError {
             CliError::PortInUse { .. } => {
                 "Stop the process using that port, or rerun with --port <free-port>. Previous dev \
                  sessions may have left a server running."
+            }
+            CliError::InvalidServePort => "Pass an explicit --port between 1 and 65535",
+            CliError::InvalidAllowedHost { .. } => {
+                "Pass an exact DNS hostname, optionally followed by :port; URLs and wildcards are not allowed"
             }
             CliError::EntryReadFailed { .. } => {
                 "Use --entry <file> to specify a different entry file"
@@ -117,6 +134,8 @@ impl CliError {
             | CliError::PressBinaryNotFound { .. } => 66,
             // A required service (the port) is unavailable → EX_UNAVAILABLE.
             CliError::PortInUse { .. } => 69,
+            // Invalid flag value → usage error.
+            CliError::InvalidServePort | CliError::InvalidAllowedHost { .. } => 2,
         }
     }
 }
@@ -180,6 +199,16 @@ mod tests {
         let port = CliError::PortInUse { port: 3000 };
         assert_eq!(port.exit_code(), 69);
         assert!(port.hint().contains("--port"));
+
+        let invalid_port = CliError::InvalidServePort;
+        assert_eq!(invalid_port.exit_code(), 2);
+        assert!(invalid_port.hint().contains("1 and 65535"));
+
+        let host = CliError::InvalidAllowedHost {
+            host: "*.example.com".into(),
+        };
+        assert_eq!(host.exit_code(), 2);
+        assert!(host.hint().contains("wildcards"));
     }
 
     #[test]
